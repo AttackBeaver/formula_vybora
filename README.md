@@ -141,7 +141,7 @@ python -m src.validate_submission
 
 | Модуль | Назначение |
 | --- | --- |
-| `data_loader.py` | Загрузка JSONL/CSV, pickle-кэш, сводка |
+| `data_loader.py` | Загрузка JSONL/CSV, pickle-кэш |
 | `metric.py` | Локальная pNDCG@5, совпадает с официальной |
 | `evaluate.py` | Оценка submission + сверка с официальным `metric.py` |
 | `popularity.py` | Взвешенная популярность (global + by institute) |
