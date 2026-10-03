@@ -1,0 +1,60 @@
+Ñòðóêòóðà ïàïîê òîìà HDD_Beaver
+Ñåðèéíûé íîìåð òîìà: 4496-4F71
+D:.
+¦   metric.py
+¦   README.md
+¦   requirements.txt
+¦   ruff.toml
+¦   tree_output.txt
+¦   
++---data
+¦   ¦   modules.jsonl
+¦   ¦   sample_submission.csv
+¦   ¦   test.jsonl
+¦   ¦   train.jsonl
+¦   ¦   val.jsonl
+¦   ¦   val_solution.csv
+¦   ¦   
+¦   L---_cache
+¦           all_data.pkl
+¦           
++---models
+¦       lgbm_ranker.txt
+¦       
++---notebooks
+¦       eda.ipynb
+¦       
++---src
+¦   ¦   check_setup.py
+¦   ¦   content.py
+¦   ¦   data_loader.py
+¦   ¦   evaluate.py
+¦   ¦   features.py
+¦   ¦   inference.py
+¦   ¦   ltr_model.py
+¦   ¦   metric.py
+¦   ¦   popularity.py
+¦   ¦   run_baseline.py
+¦   ¦   run_ltr.py
+¦   ¦   submit.py
+¦   ¦   __init__.py
+¦   ¦   
+¦   L---__pycache__
+¦           content.cpython-314.pyc
+¦           data_loader.cpython-314.pyc
+¦           evaluate.cpython-314.pyc
+¦           features.cpython-314.pyc
+¦           inference.cpython-314.pyc
+¦           ltr_model.cpython-314.pyc
+¦           metric.cpython-314.pyc
+¦           popularity.cpython-314.pyc
+¦           run_baseline.cpython-314.pyc
+¦           run_ltr.cpython-314.pyc
+¦           submit.cpython-314.pyc
+¦           __init__.cpython-314.pyc
+¦           
+L---submissions
+        submission_popularity.csv
+        val_submission_ltr.csv
+        val_submission_popularity.csv
+        

@@ -1,0 +1,26 @@
+# Конфигурация Ruff-линтера для проекта "Формула выбора"
+
+# Целевая версия Python — та же, что в .venv
+target-version = "py314"
+
+# Длина строки, при превышении которой Ruff предложит перенос
+line-length = 100
+
+[lint]
+# Какие наборы правил включаем
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes (неиспользуемые импорты, undefined names)
+    "I",   # isort (порядок импортов)
+    "UP",  # pyupgrade (современный синтаксис)
+    "B",   # flake8-bugbear (частые баги)
+    "SIM", # flake8-simplify
+]
+
+# Что не проверяем
+ignore = [
+    "E501",  # длинные строки — оставим на усмотрение
+]
+
+[lint.isort]
+known-first-party = ["src"]
