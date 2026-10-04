@@ -9,10 +9,11 @@ LightGBM Ranker — основная LTR-модель.
 LightGBM. Это позволяет early stopping останавливать обучение по правильной
 цели.
 
-Поддержка sample weights:
-    train_lgbm_ranker принимает опциональные sample_weight_train / _val.
-    Это нужно, чтобы по-разному взвешивать warm-примеры и cold-подобные
-    (маскированные).
+Поддержка sample weights и двух наборов признаков:
+    * FEATURE_COLS — v1-v3, 30 признаков с абсолютными pop_period_1/2.
+    * FEATURE_COLS_V4 — v4, 31 признак с ОТНОСИТЕЛЬНЫМИ pop_last/prev/first_period.
+      Устраняет сдвиг распределения между train (история до P2) и test
+      (история до P3/P4).
 """
 from __future__ import annotations
 
@@ -25,8 +26,10 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# Конфигурация
+# Наборы признаков
 # ---------------------------------------------------------------------------
+# v1-v3: 30 признаков с абсолютными периодами.
+# Сохранён для совместимости со старыми моделями (lgbm_ranker.txt и др.).
 FEATURE_COLS: list[str] = [
     # S — студент
     "institute", "specialty",
@@ -47,29 +50,46 @@ FEATURE_COLS: list[str] = [
     "n_available", "was_available_before",
 ]
 
+# v4: 31 признак. Абсолютные pop_period_1/2 заменены относительными
+# pop_last_period / pop_prev_period / pop_first_period, которые означают одно
+# и то же для train и test → нет сдвига распределения.
+FEATURE_COLS_V4: list[str] = [
+    # S — студент (7)
+    "institute", "specialty",
+    "n_periods", "n_choices", "n_unique_modules",
+    "avg_history_priority", "is_cold",
+    # M — модуль (10)
+    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
+    "pop_by_specialty",
+    "pop_last_period", "pop_prev_period", "pop_first_period",
+    "n_periods_available", "title_len", "desc_len",
+    # S×M — взаимодействие (14)
+    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
+    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
+    "tfidf_cos_mean", "tfidf_cos_max",
+    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
+    "n_available", "was_available_before",
+]
+
 CATEGORICAL_FEATS: list[str] = ["institute", "specialty"]
 
 # label_gain[i] = вес для label i
-# label 0 -> 0.00 (не выбран), label 1 -> 0.35 (priority 5), ..., label 5 -> 1.00 (priority 1)
+# label 0 → 0.00 (не выбран), label 1 → 0.35 (priority 5), ..., label 5 → 1.00
 LABEL_GAIN: list[float] = [0.0, 0.35, 0.45, 0.60, 0.80, 1.00]
 
-# label -> вес. Индекс 0 не используется (не выбран).
 WEIGHTS_BY_LABEL: np.ndarray = np.array(LABEL_GAIN, dtype=np.float64)
 
 DEFAULT_PARAMS: dict[str, Any] = {
     "objective": "lambdarank",
-    "metric": "None",  # отключаем встроенные метрики — считаем свою
+    "metric": "None",
     "label_gain": LABEL_GAIN,
     "lambdarank_truncation_level": 15,
-    # --- Медленнее и мягче, чем раньше ---
     "learning_rate": 0.02,
     "num_leaves": 31,
     "min_data_in_leaf": 100,
-    # --- Больше случайности → разнообразнее ансамбль ---
     "feature_fraction": 0.7,
     "bagging_fraction": 0.8,
     "bagging_freq": 1,
-    # --- Прочее ---
     "max_bin": 255,
     "verbosity": -1,
     "seed": 42,
@@ -85,15 +105,8 @@ def _pndcg5_from_arrays(
     labels: np.ndarray,
     group_sizes: np.ndarray,
 ) -> float:
-    """
-    Векторизованный подсчёт pNDCG@5 (norm=1, clip 1.0).
-
-    Работает быстро, если все группы одинакового размера.
-    Если размеры разные — падает на цикл.
-    """
     n_groups = len(group_sizes)
 
-    # Быстрый путь: все группы одного размера
     if np.all(group_sizes == group_sizes[0]):
         n_per_group = int(group_sizes[0])
         preds_2d = preds.reshape(n_groups, n_per_group)
@@ -111,7 +124,6 @@ def _pndcg5_from_arrays(
         dcg = np.minimum(dcg, 1.0)
         return float(dcg.mean())
 
-    # Медленный путь: разные размеры групп
     total = 0.0
     start = 0
     for size in group_sizes:
@@ -133,10 +145,6 @@ def pndcg5_eval(
     preds: np.ndarray,
     eval_data: lgb.Dataset,
 ) -> tuple[str, float, bool]:
-    """
-    Кастомная функция оценки для LightGBM.
-    Возвращает ('pndcg@5', значение, True).
-    """
     labels = eval_data.get_label().astype(np.int32)
     group_sizes = np.asarray(eval_data.get_group(), dtype=np.int64)
     score = _pndcg5_from_arrays(preds, labels, group_sizes)
@@ -144,7 +152,7 @@ def pndcg5_eval(
 
 
 # ---------------------------------------------------------------------------
-# Кодирование категориальных признаков
+# Кодирование категориальных
 # ---------------------------------------------------------------------------
 def encode_categoricals(
     train_df: pd.DataFrame,
@@ -152,7 +160,12 @@ def encode_categoricals(
     cat_cols: list[str] = CATEGORICAL_FEATS,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Приводит категориальные колонки в train и val к общему набору категорий.
+    Приводит категориальные колонки к общему набору категорий.
+
+    ВАЖНО: вызывающий код должен передавать сюда фрейм-источник словаря
+    (train_df) и целевой фрейм (val_df). Если val_df — это holdout, а
+    train_df — обучающая выборка, словарь будет построен на train и
+    корректно применён к val. Смешивать нельзя.
     """
     for c in cat_cols:
         all_vals = sorted(set(train_df[c].astype(str)) | set(val_df[c].astype(str)))
@@ -163,18 +176,13 @@ def encode_categoricals(
 
 
 # ---------------------------------------------------------------------------
-# Подготовка X, y, group
+# Подготовка X, y, group, w
 # ---------------------------------------------------------------------------
 def prepare_xyg(
     df: pd.DataFrame,
     feature_cols: list[str] = FEATURE_COLS,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame]:
-    """
-    Сортирует по student_id, отделяет X, y, group.
-
-    ВАЖНО: используется в существующих вызовах, сигнатура сохранена
-    для обратной совместимости. Для весов используйте prepare_xygw.
-    """
+    """Сортирует по student_id, отделяет X, y, group."""
     df_sorted = df.sort_values("student_id", kind="stable").reset_index(drop=True)
     X = df_sorted[feature_cols].copy()
     y = df_sorted["label"].to_numpy(dtype=np.int32)
@@ -189,14 +197,7 @@ def prepare_xygw(
     weight_col: str = "weight",
     feature_cols: list[str] = FEATURE_COLS,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
-    """
-    Как prepare_xyg, но возвращает ещё и веса.
-
-    Ожидает, что в df есть колонка weight_col. Если её нет — все веса = 1.0.
-
-    Returns:
-        (X, y, group_sizes, weights, df_sorted)
-    """
+    """Как prepare_xyg, но возвращает ещё и веса."""
     df_sorted = df.sort_values("student_id", kind="stable").reset_index(drop=True)
     X = df_sorted[feature_cols].copy()
     y = df_sorted["label"].to_numpy(dtype=np.int32)
@@ -227,16 +228,6 @@ def train_lgbm_ranker(
     sample_weight_train: np.ndarray | None = None,
     sample_weight_val: np.ndarray | None = None,
 ) -> lgb.Booster:
-    """
-    Обучает LightGBM Ranker с CUSTOM EVAL (наш pNDCG@5).
-
-    Args:
-        sample_weight_train: опциональные веса для train-примеров.
-                             Если None — LightGBM использует вес 1.0.
-        sample_weight_val: опциональные веса для val-примеров (на метрику
-                           не влияет, но LightGBM может их использовать
-                           в некоторых режимах).
-    """
     p = dict(DEFAULT_PARAMS)
     if params:
         p.update(params)
@@ -280,7 +271,11 @@ def predict_scores(
     df: pd.DataFrame,
     feature_cols: list[str] = FEATURE_COLS,
 ) -> np.ndarray:
-    """Возвращает массив score (float), выровненный по строкам df."""
+    """Возвращает массив score (float), выровненный по строкам df.
+
+    ВАЖНО: feature_cols должен совпадать с тем, на котором обучалась модель.
+    Для v4-моделей передавайте FEATURE_COLS_V4.
+    """
     X = df[feature_cols]
     return model.predict(X, num_iteration=model.best_iteration)
 
@@ -290,9 +285,6 @@ def top_k_per_student(
     scores: np.ndarray,
     k: int = 5,
 ) -> dict[str, list[str]]:
-    """
-    Группирует по student_id, сортирует по score, берёт top-k.
-    """
     assert len(df) == len(scores), "df и scores разошлись по длине"
 
     work = pd.DataFrame({
@@ -320,7 +312,6 @@ def feature_importance_report(
     feature_cols: list[str] = FEATURE_COLS,
     top_n: int = 20,
 ) -> pd.DataFrame:
-    """Возвращает DataFrame с важностью признаков (gain), отсортированный."""
     gain = model.feature_importance(importance_type="gain")
     split = model.feature_importance(importance_type="split")
     df = pd.DataFrame({

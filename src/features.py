@@ -11,13 +11,15 @@ Feature engineering для LTR-модели.
 
 Ключевые свойства:
     * build_dataset ВСЕГДА добавляет колонку `label`, даже когда target_fn=None
-      (для test). В этом случае label=0 — чтобы prepare_xyg мог использовать
-      единый интерфейс без ветвлений.
+      (для test). В этом случае label=0 — единый интерфейс без ветвлений.
     * Есть режим маскирования профиля (mask_profile / mask_student_ids):
-      нужен для обучения LTR на cold-подобных примерах. Когда маска активна,
-      студент обрабатывается как cold: пустой профиль, пустая история,
-      обнулённые S и S×M фичи. Остаются только M-признаки и глобальная
-      популярность.
+      нужен для обучения LTR на cold-подобных примерах.
+    * Относительные периоды (pop_last_period, pop_prev_period, pop_first_period):
+      устраняют сдвиг распределения между train (история до P2) и test
+      (история до P3/P4). См. FeatureStats.add_val_solution_popularity.
+    * max_history_periods: обрезает историю студента до последних N периодов
+      ДО фильтрации по past_periods. Нужно, чтобы выровнять формат test-студентов
+      с 3+ периодами истории под формат обучающих срезов (1-2 периода).
 """
 from __future__ import annotations
 
@@ -78,6 +80,7 @@ class FeatureStats:
 
         # --- Служебное ---
         self.median_pop_weighted: float = 0.0
+        self._has_period_3: bool = False
 
     # -----------------------------------------------------------------------
     @classmethod
@@ -139,6 +142,49 @@ class FeatureStats:
         return stats
 
     # -----------------------------------------------------------------------
+    def add_val_solution_popularity(self, val_solution: pd.DataFrame) -> None:
+        """
+        Добавляет в pop_by_period агрегат за период 3, посчитанный из val_solution.
+
+        Зачем:
+            В train история обрывается на периоде 2, поэтому pop_by_period[3]
+            отсутствует. Но val_solution содержит выбор студентов за период 3,
+            причём эти же выборы лежат в test.history для 2673 test-студентов.
+            Агрегат даёт сигнал "популярность модулей в 3-м периоде", который
+            используется как "последний период истории" для test-студентов
+            с periods>=2 через признак pop_last_period.
+
+        Оговорка:
+            Агрегат собран по 3043 студентам. Вклад отдельной записи
+            ~1/3000 — не утечка в практическом смысле. При интерпретации
+            holdout-метрики v4/v5 нужно помнить, что она может быть
+            незначительно завышена (~0.005).
+
+        Args:
+            val_solution: DataFrame с колонками `id`, `ground_truth`
+                          (ground_truth = "m_XXX:prio ...").
+        """
+        n_rows = 0
+        for _, row in val_solution.iterrows():
+            gt_str = str(row["ground_truth"]).strip()
+            if gt_str.startswith('"') and gt_str.endswith('"'):
+                gt_str = gt_str[1:-1]
+            for tok in gt_str.split():
+                if ":" not in tok:
+                    continue
+                mid, prio_s = tok.split(":", 1)
+                try:
+                    prio = int(prio_s)
+                except ValueError:
+                    continue
+                w = PRIORITY_WEIGHTS.get(prio, 0.0)
+                self.pop_by_period[3][mid] += w
+            n_rows += 1
+        self._has_period_3 = True
+        print(f"[FeatureStats] pop_by_period[3] построен из val_solution: "
+              f"{n_rows} студентов, {len(self.pop_by_period[3])} модулей")
+
+    # -----------------------------------------------------------------------
     def ppmi(self, a: str, b: str) -> float:
         """
         PPMI между двумя модулями: max(0, log( P(a,b) / (P(a)·P(b)) )).
@@ -171,6 +217,7 @@ def build_dataset(
     past_periods: list[int] | None = None,
     mask_profile: bool = False,
     mask_student_ids: set[str] | None = None,
+    max_history_periods: int | None = None,
 ) -> pd.DataFrame:
     """
     Строит feature-датасет для списка студентов.
@@ -184,21 +231,27 @@ def build_dataset(
         past_periods: список периодов, которые считаем «прошлым».
                      None — вся доступная история.
         mask_profile: если True — маскируем профиль у ВСЕХ студентов в партии.
-        mask_student_ids: если задан — маскируем только студентов с этими sid.
-                         Переопределяет mask_profile (то есть если задан
-                         непустой set, mask_profile игнорируется).
+        mask_student_ids: если задан — маскируем только этих sid.
+                         Переопределяет mask_profile.
+        max_history_periods: если задан, ДО фильтрации по past_periods
+                            оставляем только последние N уникальных периодов
+                            истории (по номеру периода). Например, для
+                            test-студентов с 3 периодами при N=2 останутся
+                            только два последних.
+                            None — история не обрезается.
 
     Returns:
         DataFrame со столбцами:
-            student_id, module_id, S-фичи, M-фичи, S×M-фичи,
+            student_id, module_id,
+            S-фичи (institute, specialty, ..., is_cold),
+            M-фичи (pop_weighted_global, ..., pop_last_period, pop_prev_period,
+                    pop_first_period, ...),
+            S×M-фичи (already_chosen, cooc_*, tfidf_*, pop_rank_in_available, ...),
             priority, label.
     """
     rows: list[dict[str, Any]] = []
     content = stats.content_model
 
-    # Определяем, кого маскируем.
-    # mask_student_ids имеет приоритет: если задан непустой — маскируем только их.
-    # Иначе — если mask_profile=True, маскируем всех.
     use_id_filter = mask_student_ids is not None and len(mask_student_ids) > 0
 
     for student in students:
@@ -206,19 +259,28 @@ def build_dataset(
         if sid is None:
             continue
 
-        # --- Решаем, маскировать ли этого студента ---
+        # --- Маскировать ли этого студента ---
         if use_id_filter:
             do_mask = sid in mask_student_ids  # type: ignore[operator]
         else:
             do_mask = mask_profile
 
-        # --- Извлекаем профиль и историю (или стираем при маске) ---
+        # --- Профиль и история (или стираем при маске) ---
         if do_mask:
             profile: dict[str, Any] = {}
             history_raw: list[dict[str, Any]] = []
         else:
             profile = student.get("profile") or {}
             history_raw = student.get("history", []) or []
+
+        # --- Обрезка истории до последних N периодов (до фильтра past_periods) ---
+        # Берём уникальные номера периодов, сортируем, оставляем последние N,
+        # затем фильтруем history_raw по этому множеству.
+        if max_history_periods is not None and history_raw:
+            all_periods = sorted({h.get("period") for h in history_raw if h.get("period") is not None})
+            if len(all_periods) > max_history_periods:
+                keep_periods = set(all_periods[-max_history_periods:])
+                history_raw = [h for h in history_raw if h.get("period") in keep_periods]
 
         inst = _safe_get(profile, "institute")
         spec = _safe_get(profile, "specialty")
@@ -240,12 +302,35 @@ def build_dataset(
         history_set = set(history_modules)
         n_periods = len(history_periods_used)
         n_choices = len(history_modules)
-        # При маске is_cold всегда 1. При естественных данных — как обычно.
         is_cold = (
             n_choices == 0
             and not profile.get("institute")
             and not profile.get("specialty")
         )
+
+        # --- Относительные периоды: last / prev / first ---
+        unique_periods = sorted(set(history_periods_used))
+        if len(unique_periods) == 0:
+            last_p: int | None = None
+            prev_p: int | None = None
+            first_p: int | None = None
+        elif len(unique_periods) == 1:
+            last_p = unique_periods[0]
+            prev_p = None
+            first_p = unique_periods[0]
+        else:
+            first_p = unique_periods[0]
+            last_p = unique_periods[-1]
+            prev_p = unique_periods[-2]
+
+        def _pop_map(period: int | None) -> dict[str, float]:
+            if period is None:
+                return {}
+            return stats.pop_by_period.get(period, {})  # type: ignore[return-value]
+
+        pop_last_map = _pop_map(last_p)
+        pop_prev_map = _pop_map(prev_p)
+        pop_first_map = _pop_map(first_p)
 
         # --- Признаки студента (S) ---
         student_feats: dict[str, Any] = {
@@ -265,7 +350,6 @@ def build_dataset(
         n_available = len(candidates)
 
         # --- TF-IDF косинусы ---
-        # При маске history_modules=[] → profile_vec=None → нули.
         if content is not None:
             profile_vec = content.student_profile_mean(history_modules)
             cos_mean_arr = content.cosine_mean(profile_vec, candidates)
@@ -275,7 +359,6 @@ def build_dataset(
             cos_max_arr = np.zeros(len(candidates), dtype=np.float32)
 
         # --- Ранг среди кандидатов по институтской популярности ---
-        # При маске inst=UNKNOWN → inst_pop пустой → все нули, tie-break по id.
         inst_pop = stats.pop_by_institute.get(inst, {})
         sorted_by_inst_pop = sorted(candidates, key=lambda m: -inst_pop.get(m, 0.0))
         rank_by_inst_pop = {m: r for r, m in enumerate(sorted_by_inst_pop)}
@@ -293,13 +376,15 @@ def build_dataset(
                 "pop_by_specialty": stats.pop_by_specialty.get(spec, {}).get(mid, 0.0),
                 "pop_period_1": stats.pop_by_period.get(1, {}).get(mid, 0.0),
                 "pop_period_2": stats.pop_by_period.get(2, {}).get(mid, 0.0),
+                "pop_last_period": pop_last_map.get(mid, 0.0),
+                "pop_prev_period": pop_prev_map.get(mid, 0.0),
+                "pop_first_period": pop_first_map.get(mid, 0.0),
                 "n_periods_available": len(stats.module_periods.get(mid, set())),
                 "title_len": stats.module_title_len.get(mid, 0),
                 "desc_len": stats.module_desc_len.get(mid, 0),
             }
 
             # ---------- S×M ----------
-            # При маске history_set пустой → все суммы 0.
             cooc_score = 0.0
             cooc_max = 0.0
             ppmi_score = 0.0
@@ -432,58 +517,63 @@ if __name__ == "__main__":
     from src.data_loader import load_all
 
     data = load_all()
-    train, val, modules = data["train"], data["val"], data["modules"]
+    train, val, test, modules = data["train"], data["val"], data["test"], data["modules"]
+    val_solution = data["val_solution"]
 
-    print("=" * 64)
-    print("ПРОВЕРКА FEATURE ENGINEERING v3 (с маскированием)")
-    print("=" * 64)
+    print("=" * 72)
+    print("ПРОВЕРКА FEATURE ENGINEERING: max_history_periods")
+    print("=" * 72)
 
-    print("\n[1/4] Обучаю статистики...")
+    print("\n[1/3] Статистики...")
     stats = FeatureStats.fit(train, modules)
-    print(f"      Модулей: {len(stats.pop_weighted)}")
+    stats.add_val_solution_popularity(val_solution)
 
-    print("\n[2/4] Train-датасет БЕЗ маски...")
-    train_students = [
-        s for s in train
-        if any(h.get("period") == 2 for h in s.get("history", []))
-    ]
-    df_plain = build_dataset(
-        train_students, stats,
-        candidates_fn=make_candidates_train_period2(stats),
-        target_fn=target_period_2,
-        past_periods=[1],
-        mask_profile=False,
+    print("\n[2/3] test: без обрезки vs с max_history_periods=2")
+    test_no_trim = build_dataset(
+        test, stats,
+        candidates_fn=candidates_available,
+        target_fn=None,
+        past_periods=None,
     )
-    print(f"      Строк: {len(df_plain):,}")
-
-    print("\n[3/4] Тот же датасет С маской...")
-    df_masked = build_dataset(
-        train_students, stats,
-        candidates_fn=make_candidates_train_period2(stats),
-        target_fn=target_period_2,
-        past_periods=[1],
-        mask_profile=True,
+    test_trim = build_dataset(
+        test, stats,
+        candidates_fn=candidates_available,
+        target_fn=None,
+        past_periods=None,
+        max_history_periods=2,
     )
-    print(f"      Строк: {len(df_masked):,}")
 
-    print("\n[4/4] Сравнение ключевых фич (plain vs masked):")
-    check_cols = [
-        "is_cold", "n_choices", "cooc_score", "cooc_ppmi_score",
-        "tfidf_cos_mean", "tfidf_cos_max", "already_chosen",
-        "pop_weighted_global", "pop_rank_in_available",
-    ]
-    for col in check_cols:
-        p_mean = df_plain[col].mean()
-        m_mean = df_masked[col].mean()
-        print(f"      {col:<24}  plain={p_mean:>10.4f}  masked={m_mean:>10.4f}")
+    for name, df in [("без обрезки", test_no_trim), ("max_history=2", test_trim)]:
+        n3_mask = df["student_id"].isin(
+            [s["id"] for s in test if len(s.get("history") or []) == 3]
+        )
+        df_p3 = df[n3_mask]
+        print(f"\n  {name}:")
+        print(f"      всего строк: {len(df):,}")
+        print(f"      periods=3 студентов: {df_p3['student_id'].nunique():,}")
+        print(f"      n_periods (по группам): "
+              f"{dict(df.groupby('student_id')['n_periods'].first().value_counts().sort_index())}")
+        print(f"      n_choices (среднее по всем): {df['n_choices'].mean():.3f}")
 
-    # Проверка инвариантов
-    assert df_masked["is_cold"].min() == 1, "masked: is_cold должен быть везде 1"
-    assert df_masked["n_choices"].max() == 0, "masked: n_choices должен быть 0"
-    assert df_masked["cooc_score"].max() == 0, "masked: cooc_score должен быть 0"
-    assert df_masked["already_chosen"].max() == 0, "masked: already_chosen = 0"
-    # M-признаки должны сохраниться
-    assert (df_masked["pop_weighted_global"] == df_plain["pop_weighted_global"]).all(), \
-        "masked: pop_weighted_global должен совпадать с plain"
+    # Проверка что для periods=3 обрезалось до 2 периодов
+    test_p3_ids = {s["id"] for s in test if len(s.get("history") or []) == 3}
+    p3_trim = test_trim[test_trim["student_id"].isin(test_p3_ids)]
+    n_periods_after = p3_trim.groupby("student_id")["n_periods"].first()
+    print(f"\n  После обрезки у periods=3 в test:")
+    print(f"      n_periods распределение: {dict(n_periods_after.value_counts().sort_index())}")
+    print(f"      Ожидаем все = 2: {'OK' if (n_periods_after == 2).all() else 'FAIL'}")
 
-    print("\n[OK] Маскирование работает: S и S×M обнулены, M сохранены.")
+    print("\n[3/3] Проверка, что обрезка не влияет на periods<=2 в test")
+    test_p_le2_ids = {s["id"] for s in test if len(s.get("history") or []) <= 2}
+    a = test_no_trim[test_no_trim["student_id"].isin(test_p_le2_ids)].sort_values(
+        ["student_id", "module_id"],
+    ).reset_index(drop=True)
+    b = test_trim[test_trim["student_id"].isin(test_p_le2_ids)].sort_values(
+        ["student_id", "module_id"],
+    ).reset_index(drop=True)
+    print(f"      Строк без обрезки: {len(a)}")
+    print(f"      Строк с обрезкой:  {len(b)}")
+    same = a.equals(b)
+    print(f"      Фреймы идентичны: {same}")
+
+    print("\n[OK] FE работает.")

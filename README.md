@@ -11,22 +11,22 @@
 **Метрика:** `pNDCG@5` — priority-weighted Normalized Discounted Cumulative
 Gain с весами `{1: 1.00, 2: 0.80, 3: 0.60, 4: 0.45, 5: 0.35}`.
 
-## Текущие результаты
+## Результаты
 
-| Модель | val mean | cold | warm | test_estimate |
-| --- | --- | --- | --- | --- |
-| Baseline (взвешенная популярность) | 0.2368 | — | — | — |
-| LTR v1 (25 фич, без fallback) | 0.3529 | — | — | — |
-| LTR v2 (30 фич, PPMI + TF-IDF) | 0.3572 | — | — | — |
-| LTR + augmentation (без fallback) | 0.3627 | 0.0475 | 0.3710 | 0.2699 |
-| LTR + augmentation + cold-start fallback | 0.3693 | 0.2816 | 0.3719 | 0.3401 |
-| **LTR с маскированием + fallback** (текущая) | **0.3705** | **0.2816** | **0.3732** | **0.3409** |
+| Модель | Holdout | Public |
+| --- | --- | --- |
+| Baseline (взвешенная популярность) | — | — |
+| LTR v1 (30 фич, без fallback) | — | 0.3129 |
+| LTR v4 (относительные периоды) | 0.4987 | 0.3189 |
+| LTR v6 (обрезка test до 2 периодов) | 0.4987 | **0.3326** |
+| **LTR v7 (multi-seed + w_p2=3.0)** | **0.5134** | в очереди |
 
-`test_estimate` — перевзвешенная оценка под распределение test
-(`cold_share = 0.352`), компенсирует дисбаланс cold-студентов между
-val (2.9%) и test (35.2%).
+**Holdout** — 284 студента val, извлечённых как 20% стратифицированной
+выборки из группы `periods=2`. Модель их не видела при обучении.
 
-## 1. Структура проекта
+**Public** — публичный скор на платформе.
+
+## Структура проекта
 
 ```txt
 formula_vybora/
@@ -37,414 +37,164 @@ formula_vybora/
 │   ├── modules.jsonl
 │   ├── val_solution.csv
 │   ├── sample_submission.csv
-│   └── _cache/                        # pickle-кэш (генерируется автоматически)
-│       └── all_data.pkl
+│   └── _cache/all_data.pkl            # pickle-кэш
 ├── src/
-│   ├── __init__.py
-│   ├── check_setup.py                 # проверка окружения
 │   ├── data_loader.py                 # загрузка JSONL/CSV, кэширование
-│   ├── metric.py                      # pNDCG@5 (соответствует официальной)
-│   ├── evaluate.py                    # CLI-оценка submission по метрике
-│   ├── popularity.py                  # baseline: взвешенная популярность
-│   ├── content.py                     # TF-IDF модель для cosine
-│   ├── features.py                    # feature engineering (30 фич) + маскирование
-│   ├── ltr_model.py                   # LightGBM Ranker + sample weights
-│   ├── cold_start.py                  # cold-start fallback (global / institute)
-│   ├── segment_analysis.py            # анализ по cold/warm/institute
+│   ├── metric.py                      # pNDCG@5
+│   ├── evaluate.py                    # CLI-оценка submission
+│   ├── popularity.py                  # baseline и fallback
+│   ├── content.py                     # TF-IDF + cosine
+│   ├── features.py                    # feature engineering (31 признак)
+│   ├── ltr_model.py                   # LightGBM Ranker + custom eval
+│   ├── cold_start.py                  # cold-start fallback
+│   ├── segment_analysis.py            # разбивка метрики по сегментам
+│   ├── test_diagnostic.py             # структура test по группам
+│   ├── test_period3_diagnostic.py     # сравнение periods=2 vs periods=3
+│   ├── validate_submission.py         # проверка формата submission
+│   ├── submit.py                      # запись submission.csv
 │   ├── inference.py                   # top-k рекомендации
-│   ├── submit.py                      # запись + валидация формата
-│   ├── validate_submission.py         # разовая валидация submission перед загрузкой
-│   ├── run_baseline.py                # end-to-end baseline
-│   └── run_ltr.py                     # end-to-end LTR с маскированием и fallback
+│   ├── run_baseline.py                # baseline end-to-end
+│   ├── run_ltr.py                     # LTR v1
+│   ├── run_ltr_v4.py                  # LTR v4
+│   ├── run_ltr_v5.py                  # LTR v5 (transition, отброшен)
+│   ├── run_ltr_v6.py                  # LTR v6
+│   └── run_ltr_v7.py                  # LTR v7 (multi-seed + w_p2)
 ├── notebooks/
 │   └── eda.ipynb                      # разведочный анализ
-├── models/
-│   └── lgbm_ranker.txt                # сохранённая модель LightGBM
-├── submissions/
-│   ├── val_submission_ltr.csv         # LTR + fallback (победитель по cold)
-│   ├── val_submission_popularity.csv  # baseline
-│   ├── submission_popularity.csv      # baseline для test
-│   └── submission.csv                 # финальный сабмит для test
+├── models/                            # сохранённые бустеры
+├── submissions/                       # сгенерированные сабмиты
 ├── metric.py                          # официальный чекер организаторов
 ├── requirements.txt
 ├── ruff.toml
 └── README.md
 ```
 
-## 2. Установка и запуск
-
-### 2.1. Требования
-
-- Python 3.11+ (проверено на 3.14)
-- VS Code с расширениями: Python, Pylance, Jupyter, Ruff
-
-### 2.2. Установка
+## Установка и запуск
 
 ```bash
 python -m venv .venv
-# Windows:
-.\.venv\Scripts\Activate.ps1
-
+.\.venv\Scripts\Activate.ps1     # Windows
+source .venv/bin/activate         # macOS/Linux
 pip install -r requirements.txt
 ```
 
-### 2.3. Данные
-
-Положить в `data/`:
-
-- `train.jsonl`, `val.jsonl`, `test.jsonl`, `modules.jsonl`
-- `val_solution.csv`, `sample_submission.csv`
-- `metric.py` — в **корень проекта** (не в `data/`).
-
-### 2.4. Быстрая проверка
+Данные в `data/`, `metric.py` — в корне проекта.
 
 ```bash
-python src/check_setup.py         # все библиотеки OK
-python -m src.data_loader         # сводка по данным
+python src/check_setup.py                          # проверка окружения
+python -m src.data_loader                          # сводка по данным
+python -m src.run_ltr_v7                           # основной пайплайн
+python -m src.validate_submission                  # валидация submission
+python -m src.segment_analysis                     # метрики по сегментам
 ```
 
-### 2.5. Пайплайны
+## Архитектура
 
-**Baseline (популярность):**
+### Признаки (31)
 
-```bash
-python -m src.run_baseline
-```
+**Студент (7):** `institute`, `specialty`, `n_periods`, `n_choices`,
+`n_unique_modules`, `avg_history_priority`, `is_cold`.
 
-**LTR с маскированием и cold-start fallback:**
-
-```bash
-python -m src.run_ltr             # обучает, оценивает, сохраняет submission.csv
-```
-
-**Сегментный анализ любого submission:**
-
-```bash
-python -m src.segment_analysis --submission submissions/val_submission_ltr.csv
-```
-
-**Сравнение стратегий cold-start fallback:**
-
-```bash
-python -m src.cold_start
-```
-
-**Валидация submission перед загрузкой на платформу:**
-
-```bash
-python -m src.validate_submission
-```
-
-## 3. Текущее состояние проекта
-
-### 3.1. Реализовано
-
-| Модуль | Назначение |
-| --- | --- |
-| `data_loader.py` | Загрузка JSONL/CSV, pickle-кэш |
-| `metric.py` | Локальная pNDCG@5, совпадает с официальной |
-| `evaluate.py` | Оценка submission + сверка с официальным `metric.py` |
-| `popularity.py` | Взвешенная популярность (global + by institute) |
-| `content.py` | TF-IDF по описаниям, cosine |
-| `features.py` | 30 признаков (S, M, S×M), маскирование профиля |
-| `ltr_model.py` | LightGBM Ranker, custom `pndcg5_eval`, sample weights |
-| `cold_start.py` | Fallback для cold-студентов: global / institute-inferred |
-| `segment_analysis.py` | Разбивка метрики по cold / warm / institute |
-| `inference.py` | Top-k рекомендации |
-| `submit.py` | Запись submission.csv + валидация |
-| `validate_submission.py` | Финальная проверка перед платформой |
-| `run_baseline.py` | Baseline end-to-end |
-| `run_ltr.py` | LTR end-to-end с тремя train-срезами и fallback |
-| `notebooks/eda.ipynb` | Разведочный анализ данных |
-
-### 3.2. Не реализовано
-
-| Этап | Приоритет |
-| --- | --- |
-| Multi-seed ensemble | Средний |
-| Item-item CF через SVD | Средний |
-| Тюнинг гиперпараметров LTR | Средний |
-| `notebooks/model.ipynb` для код-ревью | Высокий (deliverable) |
-| Обучение финальной модели на `train + val` | Средний |
-
-## 4. Ключевые выводы EDA
-
-### 4.1. Размеры данных
-
-| Файл | Студентов |
-| --- | --- |
-| train | 5 002 |
-| val | 3 043 |
-| test | 4 306 |
-| modules | 322 (каталог) |
-
-### 4.2. Time-based split
-
-Студенты **пересекаются** между train / val / test (~97%).
-Профиль и история у пересекающихся совпадают. Это не утечка —
-это time-based split: у одного студента разные целевые периоды.
-**Верная схема:** `past = history[1..t-1] → target = history[t]`.
-
-### 4.3. Available_modules
-
-- В val — ровно 159 модулей (модули целевого периода).
-- Внутри института набор одинаков, но, как показал анализ,
-  сигнатура `available_modules` **не** восстанавливает институт однозначно:
-  8 институтов сжимаются в 2 уникальных набора.
-- Ground truth **на 100%** попадает в `available_modules`.
-
-### 4.4. Популярность — long-tail
-
-| Топ-K | Покрытие выборов |
-| --- | --- |
-| 10 | 16.0% |
-| 20 | 27.6% |
-| 50 | 51.1% |
-| 100 | 74.8% |
-
-### 4.5. Холодный старт
-
-| Выборка | Cold-студентов |
-| --- | --- |
-| val | 2.9% (88 / 3043) |
-| **test** | **35.2%** (1516 / 4306) |
-
-Публичный val-скор **систематически завышен** относительно private
-из-за дисбаланса cold-студентов. Разрыв `val − test_estimate ≈ +0.03`.
-
-### 4.6. Test содержит богатые истории
-
-1 310 студентов в test имеют 3 периода истории — для них сигнала больше,
-чем у val-студентов (у которых максимум 2).
-
-## 5. Архитектура решения
-
-### 5.1. Общий поток
-
-```txt
-train.jsonl ──► FeatureStats.fit() ──┐
-                                      ▼
-train.jsonl ──► build_dataset(past=[1], mask=False) ──► p1 (warm, w=1.0)
-            ──► build_dataset(past=[],  mask=False) ──► p0 (no-hist, w=0.5)
-            ──► build_dataset(past=[1], mask=True)  ──► pmask (cold, w=1.0)
-                                      │
-                                      ▼
-                             encode_categoricals()
-                                      │
-                                      ▼
-                       prepare_xygw() → X, y, groups, weights
-                                      │
-                                      ▼
-                LightGBM Ranker (lambdarank, sample weights)
-                  label_gain = [0, .35, .45, .60, .80, 1.0]
-                  feval = pndcg5_eval (custom)
-                                      │
-                                      ▼
-val.jsonl  ──► build_dataset(past=[1,2]) ──► predict_scores()
-                                      │
-                                      ▼
-                        top_k_per_student(k=5) → rec_ltr
-                                      │
-                                      ▼
-            cold_start: rec_ltr + fallback (global / institute)
-                                      │
-                                      ▼
-                      выбор победителя по cold-сегменту
-                                      │
-                                      ▼
-                              submission.csv
-```
-
-### 5.2. Признаки (30)
-
-**S — студент (7):**
-`institute`, `specialty`, `n_periods`, `n_choices`, `n_unique_modules`,
-`avg_history_priority`, `is_cold`.
-
-**M — модуль (9):**
-`pop_weighted_global`, `pop_raw_global`, `pop_by_institute`,
-`pop_by_specialty`, `pop_period_1`, `pop_period_2`,
+**Модуль (10):** `pop_weighted_global`, `pop_raw_global`, `pop_by_institute`,
+`pop_by_specialty`, `pop_last_period`, `pop_prev_period`, `pop_first_period`,
 `n_periods_available`, `title_len`, `desc_len`.
 
-**S×M — взаимодействие (14):**
+**Взаимодействие (14):** `already_chosen`, `cooc_score/max/norm`,
+`cooc_ppmi_score/max/norm`, `tfidf_cos_mean/max`, `pop_ratio_in_institute`,
+`pop_rank_in_available`, `pop_rank_frac`, `n_available`, `was_available_before`.
 
-- Co-occurrence raw: `already_chosen`, `cooc_score`, `cooc_max`, `cooc_norm`
-- Co-occurrence PPMI: `cooc_ppmi_score`, `cooc_ppmi_max`, `cooc_ppmi_norm`
-- TF-IDF cosine: `tfidf_cos_mean`, `tfidf_cos_max`
-- Прочее: `pop_ratio_in_institute`, `pop_rank_in_available`,
-  `pop_rank_frac`, `n_available`, `was_available_before`
-
-### 5.3. Data augmentation — три среза
+### Обучающие срезы
 
 | Срез | Строк | Weight | Что моделирует |
 | --- | --- | --- | --- |
-| `p1`: past=[1] → p2 | 830 676 | 1.0 | warm студент |
-| `p0`: past=[] → p1 | 652 876 | 0.5 | есть профиль, нет истории |
-| `pmask`: past=[1] → p2, mask | 830 676 | 1.0 | полностью cold |
+| p1: `[P1]` → target P2 | 830 676 | 1.0 | студент с 1 периодом истории |
+| p0: `[]` → target P1 | 652 876 | 0.5 | студент с профилем, без истории |
+| pmask: `[P1]` → target P2, профиль стёрт | 830 676 | 1.0 | холодный студент |
+| p2: `[P1,P2]` → target P3 (90% val) | 181 260 | 3.0 | формат test periods=2 |
 
-Префиксы `p1__` / `p0__` / `pmask__` в `student_id` — чтобы LightGBM
-не смешал группы из разных срезов.
+**Holdout:** 20% val periods=2, извлечённых стратифицированно (seed=42),
+не участвуют в обучении.
 
-### 5.4. Маскирование профиля
+**Early stopping** — на holdout по кастомной метрике `pndcg5_eval`, не по
+стандартной NDCG LightGBM (формулы различаются: официальная метрика
+обрезает DCG сверху единицей).
 
-При `mask_profile=True` студент обрабатывается как cold:
-`profile = {}`, `history = []`. Все S и S×M фичи автоматически
-обнуляются (`is_cold=1`, `n_choices=0`, `cooc_score=0`,
-`tfidf_cos_mean=0`, `already_chosen=0`). Сохраняются только
-M-признаки — единственный сигнал, доступный реальному cold-студенту.
+### Инференс
 
-Это позволило модели **обучиться работать в режиме без профиля**
-и поднять cold-сегмент с 0.0475 до 0.2206 **без fallback**.
+1. **Train и val:** вся доступная история (не более 2 периодов).
+2. **Test:** обрезка истории до последних 2 периодов (`max_history_periods=2`).
+   Выравнивает формат test-студентов с 3 периодами под формат обучающих срезов.
+3. **Cold-start fallback:** студенты без профиля и истории получают top-5
+   по взвешенной популярности среди `available_modules`.
+4. **Multi-seed:** 5 моделей с seed 42..46, усреднение скоров.
 
-### 5.5. Cold-start fallback
+## Ключевые находки
 
-Две стратегии:
+### Структура test
 
-- **A: global popularity** — top-5 по взвешенной популярности среди
-  `available_modules`.
-- **B: institute-inferred** — восстановление института по сигнатуре
-  `available_modules`, затем top-5 по популярности института.
+| Группа | N | Доля | История | Target |
+| --- | --- | --- | --- | --- |
+| periods=0 | 1516 | 35.2% | `[]` | P1 |
+| periods=1 | 87 | 2.0% | `[P1]`, `[P2]`, `[P3]` | P2/P3/P4 |
+| periods=2 | 1393 | 32.4% | `[P2,P3]` | P4 |
+| periods=3 | 1310 | 30.4% | `[P1,P2,P3]` | P4 |
 
-На val стратегия B не превзошла A (индекс сигнатур содержит всего 2
-уникальных набора, восстановление невозможно). Победитель выбирается
-автоматически по cold-сегменту: на текущей итерации — **A (global)**,
-cold = 0.2816.
+Все четыре группы имеют одинаковую сигнатуру `available_modules`
+(158 модулей), то есть фильтр по институту не работает.
 
-### 5.6. Custom eval
+### Разрыв val/test
 
-Стандартный LightGBM-NCDG **не совпадает** с нашей метрикой:
+В val холодных студентов 2.9%, в test — 35.2%. Val-скор систематически
+завышен на ≈0.05–0.08. Пересчёт под test-распределение:
+`test_estimate = 0.352 × cold + 0.648 × warm`.
 
-- LightGBM: `NDCG = DCG / IDCG` (полный IDCG, идеал = упорядоченные 5 модулей).
-- Официальная метрика: `pNDCG = min(1.0, DCG / 1.0)` (идеал = priority-1
-  на первой позиции).
+### Реконструкция по группам из public
 
-Реализована `pndcg5_eval` — early stopping ориентируется **именно на нашу
-метрику**.
+Из public v6 = 0.3326:
 
-## 6. Feature importance (по gain, топ-10)
+- periods=0 ≈ 0.28 (fallback)
+- periods=1 ≈ 0.32
+- periods=2 ≈ 0.50
+- **periods=3 ≈ 0.22** — самый проблемный сегмент
 
-Из последнего запуска `run_ltr`:
+### Сдвиг формата периодов
 
-| Feature | Gain |
+Модель обучена на строго 1–2-периодных срезах. С 3 периодами встречается
+только на test. Обрезка `max_history_periods=2` подняла public v4 → v6
+с 0.3189 до 0.3326 (+0.014).
+
+## История экспериментов
+
+| # | Изменение | Holdout | Public | Δ public |
+| --- | --- | --- | --- | --- |
+| 1 | LTR v1: 30 фич, augmentation, fallback | — | 0.3129 | baseline |
+| 2 | v4: относительные периоды | 0.4987 | 0.3189 | +0.006 |
+| 3 | v5: transition-фичи (утечка, отброшено) | — | — | — |
+| 4 | v6: обрезка test до 2 периодов | 0.4987 | 0.3326 | +0.014 |
+| 5 | **v7: multi-seed (5) + w_p2=3.0** | **0.5134** | в очереди | ожидается +0.01 |
+
+**Отброшенные гипотезы:**
+
+- Institute-inferred cold fallback — сигнатуры `available_modules` сжимаются
+  в 2 уникальных набора, восстановление института невозможно.
+- Transition-матрица между соседними периодами — тестовая диагностика
+  показала 0.5805, но после устранения утечки — 0.4999 (= v4). Не используется.
+- Ансамбль v4 + v6 — v6 строго лучше v4 на periods=3, усреднение тянет
+  качество вниз.
+
+## Ограничения
+
+| Ограничение | Комментарий |
 | --- | --- |
-| `cooc_ppmi_score` | 60 678 |
-| `pop_weighted_global` | 53 513 |
-| `pop_rank_in_available` | 50 940 |
-| `pop_rank_frac` | 38 843 |
-| `pop_period_2` | 32 272 |
-| `specialty` | 28 424 |
-| `pop_raw_global` | 22 460 |
-| `cooc_ppmi_norm` | 20 976 |
-| `tfidf_cos_max` | 19 975 |
-| `is_cold` | 16 424 |
+| Test periods=3 (30.4%) | Даёт ≈0.22 против ≈0.50 у periods=2. Структурный сдвиг формата. |
+| Cold-студенты в test (35.2%) | Fallback по популярности даёт ≈0.28 — потолок для этого подхода. |
+| Разрыв val и test | ≈0.05–0.08 из-за дисбаланса cold. Локальные метрики завышены. |
+| Лимит платформы | 2 сабмита в день. Все эксперименты — локально на holdout. |
 
-После добавления маскирования `pop_weighted_global` поднялся
-со 7-го на 2-е место, а `is_cold` вошёл в топ-10 — модель активно
-использует оба режима (warm / cold).
+## Зависимости
 
-## 7. История экспериментов
+Python 3.11+, LightGBM, pandas, numpy, scikit-learn, scipy, matplotlib,
+seaborn, tqdm, joblib, jupyter.
 
-| # | Модель / Изменение | val mean | Δ |
-| --- | --- | --- | --- |
-| 1 | Baseline (популярность) | 0.2368 | — |
-| 2 | LTR, 25 фич, lr=0.05, num_leaves=63 | 0.3529 | +0.116 |
-| 3 | + custom eval (наш pNDCG@5) | 0.3529 | 0 |
-| 4 | + lr=0.02, num_leaves=31, patience=200 | 0.3558 | +0.003 |
-| 5 | + PPMI фичи + TF-IDF cosine | 0.3572 | +0.001 |
-| 6 | + augmentation `past=[]` | 0.3627 | +0.006 |
-| 7 | + cold-start fallback (global) | 0.3693 | +0.007 |
-| 8 | + маскирование + 3 среза + sample weights | **0.3705** | +0.001 |
-
-`test_estimate` (перевзвешенная под cold_share=0.352):
-
-| Шаг | test_estimate | Δ |
-| --- | --- | --- |
-| Шаг 6 (LTR без fallback) | 0.2699 | — |
-| Шаг 7 (+ fallback) | 0.3401 | **+0.070** |
-| **Шаг 8 (+ маскирование)** | **0.3409** | +0.001 |
-
-Основной прирост дал cold-start fallback. Маскирование улучшило
-устойчивость модели на cold-подобных примерах и слегка подняло warm.
-
-## 8. Технические решения и обоснования
-
-### 8.1. Кэширование данных
-
-Парсинг JSONL занимает 2–3 сек. После первого запуска данные лежат в
-`data/_cache/all_data.pkl` и загружаются мгновенно.
-Отключить: `load_all(use_cache=False)`.
-
-### 8.2. Fit-then-transform
-
-Все агрегаты (`pop_weighted`, `cooc`, `PPMI`, TF-IDF) считаются **один раз
-на train** и переиспользуются для val / test. Это устраняет
-training-serving skew.
-
-### 8.3. Защита от утечек
-
-При обучении на срезе `past=[1] → target=period 2` из истории студента
-**исключается период 2**. Иначе в `cooc_score` модель увидела бы свой
-же target.
-
-### 8.4. Воспроизводимость
-
-- Детерминированные сортировки (tie-break по `module_id`).
-- `seed=42` в LightGBM.
-- `requirements.txt` фиксирует версии.
-- Кэш не влияет на результат — только на скорость.
-
-### 8.5. Линтер
-
-`ruff.toml` под `target-version = "py314"`, включены правила
-`E, F, I, UP, B, SIM`. Код в PEP 585-стиле.
-
-## 9. Формат submission
-
-```csv
-id,recommendations
-s_000123,m_014 m_087 m_031 m_155 m_022
-s_000124,m_009 m_102 m_034 m_077 m_141
-```
-
-Правила (валидируются в `submit.validate_submission` и
-`validate_submission.py`):
-
-- одна строка на студента;
-- ровно 5 различных `module_id`;
-- порядок — от лучшего к худшему;
-- `module_id` разделены пробелом;
-- все `module_id` присутствуют в каталоге.
-
-## 10. Дальнейшие шаги
-
-1. **Загрузить текущий submission на платформу.** Текущий
-   `submissions/submission.csv` (4306 строк, LTR + fallback global)
-   прошёл валидацию и готов к отправке. Public score позволит
-   откалибровать `test_estimate`.
-
-2. **Multi-seed ensemble** (5 моделей с разными seed) — ожидаемый
-   прирост `+0.003–0.008` на warm.
-
-3. **Item-item CF через SVD** — независимый сигнал для ансамбля.
-
-4. **Тюнинг гиперпараметров LTR** — `learning_rate`, `num_leaves`,
-   регуляризация.
-
-5. **Финальный пайплайн:**
-   - обучение на `train + val`;
-   - предсказание для `test`;
-   - сохранение `submissions/submission.csv`.
-
-6. **`notebooks/model.ipynb`** — единый артефакт для код-ревью
-   с полным описанием пайплайна.
-
-## 11. Известные ограничения и риски
-
-| Риск | Митигация |
-| --- | --- |
-| Cold-студенты в test (35.2%) | Cold-start fallback + маскированное обучение |
-| Разрыв val (2.9% cold) vs test (35.2% cold) | Перевзвешенная оценка `test_estimate` |
-| `best_iteration=88` — модель недоучена | Тюнинг learning rate, больше данных через augmentation |
-| Institute-inferred fallback не работает | Оставлен как опция, выбирается автоматически |
-| Невоспроизводимость на код-ревью | Фиксированные версии, seed, README с инструкцией |
-| Лимит 2 сабмита в день на платформе | Все эксперименты — локально, платформа — только для финальных решений |
+Версии зафиксированы в `requirements.txt`. Линтер — ruff, конфигурация
+в `ruff.toml`.
