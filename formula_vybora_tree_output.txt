@@ -38478,29 +38478,38 @@ D:.
 ¦           
 +---models
 ¦       lgbm_ranker.txt
+¦       lgbm_ranker_final.txt
 ¦       lgbm_ranker_v2.txt
 ¦       lgbm_ranker_v3.txt
 ¦       lgbm_ranker_v4.txt
 ¦       lgbm_ranker_v5.txt
 ¦       lgbm_ranker_v6.txt
 ¦       lgbm_ranker_v7.txt
+¦       lgbm_ranker_v8.txt
+¦       lgbm_ranker_v9.txt
+¦       lgbm_ranker_v9_tuned.txt
 ¦       
 +---notebooks
 ¦       eda.ipynb
 ¦       
 +---src
+¦   ¦   als_model.py
 ¦   ¦   check_setup.py
 ¦   ¦   cold_start.py
 ¦   ¦   content.py
+¦   ¦   content_cold_start.py
 ¦   ¦   data_loader.py
 ¦   ¦   ensemble_v4_v6.py
 ¦   ¦   evaluate.py
 ¦   ¦   features.py
+¦   ¦   features_v2.py
 ¦   ¦   inference.py
 ¦   ¦   ltr_model.py
 ¦   ¦   metric.py
 ¦   ¦   popularity.py
 ¦   ¦   run_baseline.py
+¦   ¦   run_ensemble.py
+¦   ¦   run_final.py
 ¦   ¦   run_ltr.py
 ¦   ¦   run_ltr_v2.py
 ¦   ¦   run_ltr_v3.py
@@ -38509,8 +38518,14 @@ D:.
 ¦   ¦   run_ltr_v5_diagnostic.py
 ¦   ¦   run_ltr_v6.py
 ¦   ¦   run_ltr_v7.py
+¦   ¦   run_ltr_v7_robust.py
+¦   ¦   run_ltr_v8.py
+¦   ¦   run_ltr_v9.py
+¦   ¦   run_ltr_v9_tuned.py
 ¦   ¦   segment_analysis.py
+¦   ¦   segment_eval.py
 ¦   ¦   submit.py
+¦   ¦   test_cold_masked.py
 ¦   ¦   test_diagnostic.py
 ¦   ¦   test_diagnostic_raw.py
 ¦   ¦   test_period3_diagnostic.py
@@ -38519,8 +38534,10 @@ D:.
 ¦   ¦   __init__.py
 ¦   ¦   
 ¦   L---__pycache__
+¦           als_model.cpython-314.pyc
 ¦           cold_start.cpython-314.pyc
 ¦           content.cpython-314.pyc
+¦           content_cold_start.cpython-314.pyc
 ¦           data_loader.cpython-314.pyc
 ¦           ensemble_v4_v6.cpython-314.pyc
 ¦           evaluate.cpython-314.pyc
@@ -38530,6 +38547,8 @@ D:.
 ¦           metric.cpython-314.pyc
 ¦           popularity.cpython-314.pyc
 ¦           run_baseline.cpython-314.pyc
+¦           run_ensemble.cpython-314.pyc
+¦           run_final.cpython-314.pyc
 ¦           run_ltr.cpython-314.pyc
 ¦           run_ltr_v2.cpython-314.pyc
 ¦           run_ltr_v3.cpython-314.pyc
@@ -38538,8 +38557,14 @@ D:.
 ¦           run_ltr_v5_diagnostic.cpython-314.pyc
 ¦           run_ltr_v6.cpython-314.pyc
 ¦           run_ltr_v7.cpython-314.pyc
+¦           run_ltr_v7_robust.cpython-314.pyc
+¦           run_ltr_v8.cpython-314.pyc
+¦           run_ltr_v9.cpython-314.pyc
+¦           run_ltr_v9_tuned.cpython-314.pyc
 ¦           segment_analysis.cpython-314.pyc
+¦           segment_eval.cpython-314.pyc
 ¦           submit.cpython-314.pyc
+¦           test_cold_masked.cpython-314.pyc
 ¦           test_diagnostic.cpython-314.pyc
 ¦           test_diagnostic_raw.cpython-314.pyc
 ¦           test_period3_diagnostic.cpython-314.pyc
@@ -38550,6 +38575,7 @@ D:.
 L---submissions
         submission.csv
         submission_ensemble.csv
+        submission_final.csv
         submission_popularity.csv
         submission_v2.csv
         submission_v3.csv
@@ -38557,6 +38583,10 @@ L---submissions
         submission_v5.csv
         submission_v6.csv
         submission_v7.csv
+        submission_v8.csv
+        submission_v9.csv
+        submission_v9_tuned.csv
+        submission_v9_tuned_global.csv
         val_submission_ltr.csv
         val_submission_ltr_cold.csv
         val_submission_ltr_v2.csv
@@ -38565,5 +38595,8 @@ L---submissions
         val_submission_ltr_v5.csv
         val_submission_ltr_v6.csv
         val_submission_ltr_v7.csv
+        val_submission_ltr_v8.csv
+        val_submission_ltr_v9.csv
+        val_submission_ltr_v9_tuned.csv
         val_submission_popularity.csv
         
