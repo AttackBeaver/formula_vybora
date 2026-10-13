@@ -16,17 +16,28 @@ KFold-evaluator: честная метрика на warm-val + cold-val.
     Composite = 0.352 × cold + 0.648 × warm_OOF.
 
 ПАРАМЕТРЫ:
-    --apply-fix {0,1}       — перезаписывать pop_last/prev/first по истинным периодам (default 1)
-    --weight-valp1 FLOAT    — вес val_p1 в обучении (0 = отключить срез, default 1.0)
-    --weight-p2 FLOAT       — вес val_p2 в обучении (default 3.0)
-    --n-seeds INT           — seeds на фолд (default 1)
-    --n-folds INT           — число фолдов (default 5)
+    --apply-fix {0,1}          — перезаписывать pop_last/prev/first по истинным периодам (default 1)
+    --weight-valp1 FLOAT       — вес val_p1 в обучении (0 = отключить, default 1.0)
+    --weight-p2 FLOAT          — вес val_p2 в обучении (default 3.0)
+    --n-seeds INT              — seeds на фолд (default 1)
+    --n-folds INT              — число фолдов (default 5)
+    --content-backend {tfidf,embed,both,none}
+                               — какой content-сигнал считать (default tfidf)
+    --feature-set {v4,v5,v6}   — какой набор признаков подавать в LightGBM (default v4)
 
 ПРИМЕРЫ:
-    python -m src.kfold_eval                              # v23-базовая
-    python -m src.kfold_eval --weight-valp1 0.0           # v24 (без val_p1)
-    python -m src.kfold_eval --apply-fix 0                # чистый v7 через KFold
-    python -m src.kfold_eval --n-seeds 3                  # 3 seeds на фолд
+    # v7-baseline (TF-IDF + v4)
+    python -m src.kfold_eval
+
+    # v29a: embeddings вместо TF-IDF
+    python -m src.kfold_eval --content-backend embed --feature-set v5
+
+    # v29b: оба content-сигнала
+    python -m src.kfold_eval --content-backend both --feature-set v6
+
+    # Проверка: несовместимые комбинации падают с ошибкой
+    python -m src.kfold_eval --content-backend tfidf --feature-set v5
+        → ERROR: feature_set='v5' требует content_backend ∈ {'embed','both'}
 """
 from __future__ import annotations
 
@@ -54,7 +65,8 @@ from src.features import (
 )
 from src.ltr_model import (
     CATEGORICAL_FEATS,
-    FEATURE_COLS_V4,
+    COMPATIBLE_FEATURE_SETS,
+    FEATURE_SETS,
     encode_categoricals,
     predict_scores,
     prepare_xygw,
@@ -219,6 +231,22 @@ def _prepare_static_slices(
     return train_df_p1, train_df_p0, train_df_pmask
 
 
+def _validate_combo(content_backend: str, feature_set: str) -> None:
+    """Проверяет, что feature_set совместим с content_backend."""
+    if feature_set not in FEATURE_SETS:
+        raise ValueError(
+            f"feature_set={feature_set!r}, ожидалось одно из "
+            f"{sorted(FEATURE_SETS)}"
+        )
+    allowed = COMPATIBLE_FEATURE_SETS.get(content_backend, ())
+    if feature_set not in allowed:
+        raise ValueError(
+            f"feature_set={feature_set!r} требует content_backend ∈ "
+            f"{sorted(allowed)}, а получено {content_backend!r}. "
+            f"Подсказка: v4↔tfidf, v5↔embed, v6↔both."
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="KFold-evaluator")
     parser.add_argument("--apply-fix", type=int, default=1,
@@ -229,7 +257,26 @@ def main() -> None:
                         help="вес val_p2 среза")
     parser.add_argument("--n-seeds", type=int, default=1)
     parser.add_argument("--n-folds", type=int, default=5)
+    parser.add_argument(
+        "--content-backend",
+        choices=("tfidf", "embed", "both", "none"),
+        default="tfidf",
+        help="Какой content-сигнал считать (default: tfidf)",
+    )
+    parser.add_argument(
+        "--feature-set",
+        choices=tuple(FEATURE_SETS.keys()),
+        default="v4",
+        help="Какой набор признаков подавать в LightGBM (default: v4)",
+    )
     args = parser.parse_args()
+
+    # Ранняя валидация: несовместимая пара — сразу ошибка.
+    try:
+        _validate_combo(args.content_backend, args.feature_set)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        raise SystemExit(2)
 
     apply_fix = bool(args.apply_fix)
     weight_valp1 = float(args.weight_valp1)
@@ -238,12 +285,17 @@ def main() -> None:
     n_folds = max(2, int(args.n_folds))
     seeds = [BASE_SEED + i for i in range(n_seeds)]
 
+    feature_cols = FEATURE_SETS[args.feature_set]
+    content_backend = args.content_backend
+
     print("=" * 78)
     print(f"KFold-evaluator")
-    print(f"  apply_fix={apply_fix}")
-    print(f"  weight_valp1={weight_valp1}")
-    print(f"  weight_p2={weight_p2}")
-    print(f"  n_seeds={n_seeds}, n_folds={n_folds}")
+    print(f"  apply_fix        = {apply_fix}")
+    print(f"  weight_valp1     = {weight_valp1}")
+    print(f"  weight_p2        = {weight_p2}")
+    print(f"  n_seeds          = {n_seeds}, n_folds={n_folds}")
+    print(f"  content_backend  = {content_backend}")
+    print(f"  feature_set      = {args.feature_set} ({len(feature_cols)} признаков)")
     print("=" * 78)
 
     t0 = time.time()
@@ -255,8 +307,8 @@ def main() -> None:
     val_gt_raw = dict(zip(val_solution["id"], val_solution["ground_truth"]))
 
     # ==== 1. Статистики ====
-    print("\n[1/4] Статистики...")
-    stats = FeatureStats.fit(train, modules)
+    print(f"\n[1/4] Статистики (content_backend={content_backend})...")
+    stats = FeatureStats.fit(train, modules, content_backend=content_backend)
     stats.add_val_solution_popularity(val_solution)
 
     # ==== 2. Фиксированные срезы ====
@@ -372,9 +424,9 @@ def main() -> None:
         hold_df_fold = all_df.iloc[n_train:].reset_index(drop=True)
 
         X_train, y_train, g_train, w_train, _ = prepare_xygw(
-            train_df_fold, feature_cols=FEATURE_COLS_V4)
+            train_df_fold, feature_cols=feature_cols)
         X_hold, y_hold, g_hold, w_hold, hold_sorted = prepare_xygw(
-            hold_df_fold, feature_cols=FEATURE_COLS_V4)
+            hold_df_fold, feature_cols=feature_cols)
 
         # --- Модели на всех seeds ---
         hold_preds_list: list[np.ndarray] = []
@@ -391,7 +443,7 @@ def main() -> None:
                 sample_weight_val=w_hold,
             )
             hold_preds_list.append(
-                predict_scores(model, hold_sorted, feature_cols=FEATURE_COLS_V4))
+                predict_scores(model, hold_sorted, feature_cols=feature_cols))
 
         hold_preds = np.mean(hold_preds_list, axis=0)
         rec_fold = top_k_per_student(hold_sorted, hold_preds, k=5)

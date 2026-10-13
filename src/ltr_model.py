@@ -9,11 +9,27 @@ LightGBM Ranker — основная LTR-модель.
 LightGBM. Это позволяет early stopping останавливать обучение по правильной
 цели.
 
-Поддержка sample weights и двух наборов признаков:
-    * FEATURE_COLS — v1-v3, 30 признаков с абсолютными pop_period_1/2.
-    * FEATURE_COLS_V4 — v4, 31 признак с ОТНОСИТЕЛЬНЫМИ pop_last/prev/first_period.
-      Устраняет сдвиг распределения между train (история до P2) и test
-      (история до P3/P4).
+Поддержка sample weights и НЕСКОЛЬКИХ наборов признаков:
+
+    FEATURE_COLS     — v1-v3, 30 признаков с абсолютными pop_period_1/2.
+    FEATURE_COLS_V4  — v4, 31 признак с ОТНОСИТЕЛЬНЫМИ pop_last/prev/first_period.
+                       Устраняет сдвиг распределения между train (история до P2)
+                       и test (история до P3/P4). Используется в v7.
+    FEATURE_COLS_V5  — v29a, 31 признак. TF-IDF заменён на семантические
+                       эмбеддинги (embed_cos_mean/max).
+    FEATURE_COLS_V6  — v29b, 33 признака. Оба content-сигнала (TF-IDF + embed).
+    FEATURE_COLS_V7  — v4 без 3 rank-фич (pop_rank_in_available,
+                       pop_rank_frac, pop_ratio_in_institute). Гипотеза:
+                       для cold-студентов (нет института) pop_rank_* — это
+                       алфавитная сортировка, т.е. шум; модель тратит
+                       ёмкость впустую. См. diag_val_vs_test_available.py.
+    FEATURE_COLS_V8  — v6 (both) без 3 rank-фич. Кандидат в production.
+
+ВАЖНО: набор фичей должен соответствовать тому, как посчитан датасет.
+При content_backend="embed" в FeatureStats.build_dataset колонки
+tfidf_cos_* заполнены нулями — значит, использовать нужно FEATURE_COLS_V5.
+При content_backend="both" — оба набора заполнены, использовать FEATURE_COLS_V6
+или FEATURE_COLS_V8.
 """
 from __future__ import annotations
 
@@ -70,6 +86,107 @@ FEATURE_COLS_V4: list[str] = [
     "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
     "n_available", "was_available_before",
 ]
+
+# v5: 31 признак. TF-IDF заменён на семантические эмбеддинги.
+# Всё остальное — как в v4.
+FEATURE_COLS_V5: list[str] = [
+    # S — студент (7)
+    "institute", "specialty",
+    "n_periods", "n_choices", "n_unique_modules",
+    "avg_history_priority", "is_cold",
+    # M — модуль (10)
+    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
+    "pop_by_specialty",
+    "pop_last_period", "pop_prev_period", "pop_first_period",
+    "n_periods_available", "title_len", "desc_len",
+    # S×M — взаимодействие (14, но content теперь embed)
+    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
+    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
+    "embed_cos_mean", "embed_cos_max",
+    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
+    "n_available", "was_available_before",
+]
+
+# v6: 33 признака. Оба content-сигнала: TF-IDF и embeddings.
+FEATURE_COLS_V6: list[str] = [
+    # S — студент (7)
+    "institute", "specialty",
+    "n_periods", "n_choices", "n_unique_modules",
+    "avg_history_priority", "is_cold",
+    # M — модуль (10)
+    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
+    "pop_by_specialty",
+    "pop_last_period", "pop_prev_period", "pop_first_period",
+    "n_periods_available", "title_len", "desc_len",
+    # S×M — взаимодействие (16, оба content-сигнала)
+    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
+    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
+    "tfidf_cos_mean", "tfidf_cos_max",
+    "embed_cos_mean", "embed_cos_max",
+    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
+    "n_available", "was_available_before",
+]
+
+# v7: 28 признаков. v4 без 3 rank-фич.
+# Гипотеза: для cold-студентов (нет института → pop_by_institute=0)
+# pop_rank_in_available превращается в алфавитную сортировку module_id
+# → чистый шум. pop_rank_frac и pop_ratio_in_institute наследуют ту же
+# проблему. Модель тратит ёмкость впустую (см. diag_val_vs_test_available).
+FEATURE_COLS_V7: list[str] = [
+    # S — студент (7)
+    "institute", "specialty",
+    "n_periods", "n_choices", "n_unique_modules",
+    "avg_history_priority", "is_cold",
+    # M — модуль (10)
+    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
+    "pop_by_specialty",
+    "pop_last_period", "pop_prev_period", "pop_first_period",
+    "n_periods_available", "title_len", "desc_len",
+    # S×M — взаимодействие (11, без rank-3)
+    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
+    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
+    "tfidf_cos_mean", "tfidf_cos_max",
+    "n_available", "was_available_before",
+]
+
+# v8: 30 признаков. v6 (оба content-сигнала) без 3 rank-фич.
+# Кандидат в production после калибровки на eval_clean.
+FEATURE_COLS_V8: list[str] = [
+    # S — студент (7)
+    "institute", "specialty",
+    "n_periods", "n_choices", "n_unique_modules",
+    "avg_history_priority", "is_cold",
+    # M — модуль (10)
+    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
+    "pop_by_specialty",
+    "pop_last_period", "pop_prev_period", "pop_first_period",
+    "n_periods_available", "title_len", "desc_len",
+    # S×M — взаимодействие (13, без rank-3)
+    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
+    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
+    "tfidf_cos_mean", "tfidf_cos_max",
+    "embed_cos_mean", "embed_cos_max",
+    "n_available", "was_available_before",
+]
+
+# Удобный словарь для CLI: имя набора → список колонок.
+FEATURE_SETS: dict[str, list[str]] = {
+    "v4": FEATURE_COLS_V4,
+    "v5": FEATURE_COLS_V5,
+    "v6": FEATURE_COLS_V6,
+    "v7": FEATURE_COLS_V7,
+    "v8": FEATURE_COLS_V8,
+}
+
+# Соответствие content_backend → какие feature-set'ы с ним совместимы.
+# v7/v8 не зависят от content-колонок rank-типа, но всё равно требуют
+# наличия tfidf_cos_* (v7) или обоих наборов (v8) в датасете.
+COMPATIBLE_FEATURE_SETS: dict[str, tuple[str, ...]] = {
+    "tfidf": ("v4", "v6", "v7", "v8"),
+    "embed": ("v5", "v6", "v8"),
+    "both":  ("v4", "v5", "v6", "v7", "v8"),
+    "none":  ("v4", "v7"),
+}
 
 CATEGORICAL_FEATS: list[str] = ["institute", "specialty"]
 
@@ -166,6 +283,10 @@ def encode_categoricals(
     (train_df) и целевой фрейм (val_df). Если val_df — это holdout, а
     train_df — обучающая выборка, словарь будет построен на train и
     корректно применён к val. Смешивать нельзя.
+
+    Для единого словаря в run_ltr_v7 используется трюк: передать
+    all_df дважды (train_df=all_df, val_df=all_df). Тогда набор
+    категорий покрывает train+val+test.
     """
     for c in cat_cols:
         all_vals = sorted(set(train_df[c].astype(str)) | set(val_df[c].astype(str)))
@@ -274,7 +395,8 @@ def predict_scores(
     """Возвращает массив score (float), выровненный по строкам df.
 
     ВАЖНО: feature_cols должен совпадать с тем, на котором обучалась модель.
-    Для v4-моделей передавайте FEATURE_COLS_V4.
+    Для v4-моделей передавайте FEATURE_COLS_V4, для v5 — FEATURE_COLS_V5,
+    для v6 — FEATURE_COLS_V6, для v7/v8 — FEATURE_COLS_V7/V8.
     """
     X = df[feature_cols]
     return model.predict(X, num_iteration=model.best_iteration)
