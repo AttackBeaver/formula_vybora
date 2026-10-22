@@ -1,38 +1,20 @@
 """
 LightGBM Ranker — основная LTR-модель.
 
-Использует objective='lambdarank' с кастомным label_gain, соответствующим
-весам приоритетов из метрики pNDCG@5.
+Использует objective='lambdarank' с кастомным label_gain и custom eval
+pndcg5_eval (наша метрика с clip-1.0).
 
-Отличительная особенность: используется CUSTOM EVAL `pndcg5_eval`,
-считающий ИМЕННО нашу метрику (norm=1, clip at 1.0) — а не классический NDCG
-LightGBM. Это позволяет early stopping останавливать обучение по правильной
-цели.
+ДВЕ КОНЦЕПЦИИ (v47+):
+    * LABEL_GAIN — веса для lambdarank objective (градиенты).
+      v47 показал, что усиление priority-1 до 1.5 ВРЕДИТ (cold −0.031,
+      warm −0.006). Откат к каноничному [0, 0.35, 0.45, 0.60, 0.80, 1.0].
+    * METRIC_WEIGHTS_BY_LABEL — веса для custom eval и pndcg5_eval.
+      Должны совпадать с официальной метрикой. НЕЛЬЗЯ менять.
 
-Поддержка sample weights и НЕСКОЛЬКИХ наборов признаков:
-
-    FEATURE_COLS     — v1-v3, 30 признаков с абсолютными pop_period_1/2.
-    FEATURE_COLS_V4  — v4, 31 признак с ОТНОСИТЕЛЬНЫМИ pop_last/prev/first.
-                       Используется в v7 (champion).
-    FEATURE_COLS_V5  — 31 признак. TF-IDF заменён на embeddings.
-    FEATURE_COLS_V6  — 33 признака. TF-IDF + embeddings.
-    FEATURE_COLS_V7  — v4 без 3 rank-фич (pop_rank_in_available,
-                       pop_rank_frac, pop_ratio_in_institute).
-    FEATURE_COLS_V8  — v6 без 3 rank-фич.
-    FEATURE_COLS_V11 — v4 + 3 глобальные rank-фичи:
-                       pop_rank_global, pop_rank_global_in_avail,
-                       pop_rank_global_frac.
-                       Гипотеза: pop_rank_in_available вырождается для cold
-                       (нет института → pop_by_institute=0 → алфавитный
-                       порядок). Глобальные rank-фичи остаются
-                       осмысленными и для cold, и для warm.
-    FEATURE_COLS_V12 — v7 + те же 3 глобальные rank-фичи.
-                       Это ЗАМЕНА вырождающихся rank-3 на глобальные.
-
-ВАЖНО: набор фичей должен соответствовать тому, как посчитан датасет.
-При content_backend="embed" в FeatureStats.build_dataset колонки
-tfidf_cos_* заполнены нулями — значит, использовать нужно FEATURE_COLS_V5.
-При content_backend="both" — оба набора заполнены, использовать FEATURE_COLS_V6/V8.
+Наборы признаков:
+    v4, v5, v6, v7, v8, v11, v12, v14 — основные
+    v15 = V11 − pop_rank_global_frac  (убрать дубль in_avail)
+    v16 = V11 − title_len − desc_len  (убрать прокси ID модуля)
 """
 from __future__ import annotations
 
@@ -47,40 +29,28 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Наборы признаков
 # ---------------------------------------------------------------------------
-# v1-v3: 30 признаков с абсолютными периодами.
 FEATURE_COLS: list[str] = [
-    # S — студент
     "institute", "specialty",
     "n_periods", "n_choices", "n_unique_modules",
     "avg_history_priority", "is_cold",
-    # M — модуль
     "pop_weighted_global", "pop_raw_global", "pop_by_institute",
     "pop_by_specialty", "pop_period_1", "pop_period_2",
     "n_periods_available", "title_len", "desc_len",
-    # S×M — взаимодействие (raw co-occurrence)
     "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
-    # S×M — взаимодействие (PPMI co-occurrence)
     "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    # S×M — content-based (TF-IDF cosine)
     "tfidf_cos_mean", "tfidf_cos_max",
-    # S×M — прочее
     "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
     "n_available", "was_available_before",
 ]
 
-# v4: 31 признак. Абсолютные pop_period_1/2 заменены относительными
-# pop_last_period / pop_prev_period / pop_first_period.
 FEATURE_COLS_V4: list[str] = [
-    # S — студент (7)
     "institute", "specialty",
     "n_periods", "n_choices", "n_unique_modules",
     "avg_history_priority", "is_cold",
-    # M — модуль (10)
     "pop_weighted_global", "pop_raw_global", "pop_by_institute",
     "pop_by_specialty",
     "pop_last_period", "pop_prev_period", "pop_first_period",
     "n_periods_available", "title_len", "desc_len",
-    # S×M — взаимодействие (14)
     "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
     "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
     "tfidf_cos_mean", "tfidf_cos_max",
@@ -88,18 +58,14 @@ FEATURE_COLS_V4: list[str] = [
     "n_available", "was_available_before",
 ]
 
-# v5: 31 признак. TF-IDF заменён на семантические эмбеддинги.
 FEATURE_COLS_V5: list[str] = [
-    # S — студент (7)
     "institute", "specialty",
     "n_periods", "n_choices", "n_unique_modules",
     "avg_history_priority", "is_cold",
-    # M — модуль (10)
     "pop_weighted_global", "pop_raw_global", "pop_by_institute",
     "pop_by_specialty",
     "pop_last_period", "pop_prev_period", "pop_first_period",
     "n_periods_available", "title_len", "desc_len",
-    # S×M — взаимодействие (14, content теперь embed)
     "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
     "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
     "embed_cos_mean", "embed_cos_max",
@@ -107,18 +73,14 @@ FEATURE_COLS_V5: list[str] = [
     "n_available", "was_available_before",
 ]
 
-# v6: 33 признака. Оба content-сигнала: TF-IDF и embeddings.
 FEATURE_COLS_V6: list[str] = [
-    # S — студент (7)
     "institute", "specialty",
     "n_periods", "n_choices", "n_unique_modules",
     "avg_history_priority", "is_cold",
-    # M — модуль (10)
     "pop_weighted_global", "pop_raw_global", "pop_by_institute",
     "pop_by_specialty",
     "pop_last_period", "pop_prev_period", "pop_first_period",
     "n_periods_available", "title_len", "desc_len",
-    # S×M — взаимодействие (16, оба content-сигнала)
     "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
     "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
     "tfidf_cos_mean", "tfidf_cos_max",
@@ -127,36 +89,28 @@ FEATURE_COLS_V6: list[str] = [
     "n_available", "was_available_before",
 ]
 
-# v7: 28 признаков. v4 без 3 rank-фич (для ablation).
 FEATURE_COLS_V7: list[str] = [
-    # S — студент (7)
     "institute", "specialty",
     "n_periods", "n_choices", "n_unique_modules",
     "avg_history_priority", "is_cold",
-    # M — модуль (10)
     "pop_weighted_global", "pop_raw_global", "pop_by_institute",
     "pop_by_specialty",
     "pop_last_period", "pop_prev_period", "pop_first_period",
     "n_periods_available", "title_len", "desc_len",
-    # S×M — взаимодействие (11, без rank-3)
     "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
     "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
     "tfidf_cos_mean", "tfidf_cos_max",
     "n_available", "was_available_before",
 ]
 
-# v8: 30 признаков. v6 (оба content) без 3 rank-фич.
 FEATURE_COLS_V8: list[str] = [
-    # S — студент (7)
     "institute", "specialty",
     "n_periods", "n_choices", "n_unique_modules",
     "avg_history_priority", "is_cold",
-    # M — модуль (10)
     "pop_weighted_global", "pop_raw_global", "pop_by_institute",
     "pop_by_specialty",
     "pop_last_period", "pop_prev_period", "pop_first_period",
     "n_periods_available", "title_len", "desc_len",
-    # S×M — взаимодействие (13, оба content, без rank-3)
     "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
     "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
     "tfidf_cos_mean", "tfidf_cos_max",
@@ -164,55 +118,104 @@ FEATURE_COLS_V8: list[str] = [
     "n_available", "was_available_before",
 ]
 
-# v11: 34 признака. v4 + 3 глобальные rank-фичи.
-# Гипотеза: pop_rank_in_available вырождается для cold (нет института).
-# Глобальные rank-фичи (по pop_weighted) остаются осмысленными.
 FEATURE_COLS_V11: list[str] = [
-    # S — студент (7)
     "institute", "specialty",
     "n_periods", "n_choices", "n_unique_modules",
     "avg_history_priority", "is_cold",
-    # M — модуль (10)
     "pop_weighted_global", "pop_raw_global", "pop_by_institute",
     "pop_by_specialty",
     "pop_last_period", "pop_prev_period", "pop_first_period",
     "n_periods_available", "title_len", "desc_len",
-    # S×M — взаимодействие (14 старых + 3 новых = 17)
     "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
     "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
     "tfidf_cos_mean", "tfidf_cos_max",
     "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
     "n_available", "was_available_before",
-    # --- v11: глобальные rank-фичи ---
     "pop_rank_global",
     "pop_rank_global_in_avail",
     "pop_rank_global_frac",
 ]
 
-# v12: 31 признак. v7 + 3 глобальные rank-фичи.
-# = ЗАМЕНА вырождающихся rank-3 на глобальные.
 FEATURE_COLS_V12: list[str] = [
-    # S — студент (7)
     "institute", "specialty",
     "n_periods", "n_choices", "n_unique_modules",
     "avg_history_priority", "is_cold",
-    # M — модуль (10)
     "pop_weighted_global", "pop_raw_global", "pop_by_institute",
     "pop_by_specialty",
     "pop_last_period", "pop_prev_period", "pop_first_period",
     "n_periods_available", "title_len", "desc_len",
-    # S×M — взаимодействие (11 без rank-3 + 3 новых = 14)
     "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
     "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
     "tfidf_cos_mean", "tfidf_cos_max",
     "n_available", "was_available_before",
-    # --- v12: глобальные rank-фичи ---
     "pop_rank_global",
     "pop_rank_global_in_avail",
     "pop_rank_global_frac",
 ]
 
-# Удобный словарь для CLI: имя набора → список колонок.
+FEATURE_COLS_V14: list[str] = [
+    "institute", "specialty",
+    "n_periods", "n_choices", "n_unique_modules",
+    "avg_history_priority", "is_cold",
+    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
+    "pop_by_specialty",
+    "pop_last_period", "pop_prev_period", "pop_first_period",
+    "pop_delta", "pop_delta_norm",
+    "n_periods_available", "title_len", "desc_len",
+    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
+    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
+    "tfidf_cos_mean", "tfidf_cos_max",
+    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
+    "n_available", "was_available_before",
+    "pop_rank_global",
+    "pop_rank_global_in_avail",
+    "pop_rank_global_frac",
+    "pop_delta_rank",
+]
+
+# v15: V11 − pop_rank_global_frac
+# Для фиксированного n_available (158/159) pop_rank_global_frac =
+# pop_rank_global_in_avail / n_available. Это ПОЛНЫЙ дубль (линейное
+# преобразование с константой). Одна из двух фич избыточна.
+FEATURE_COLS_V15: list[str] = [
+    "institute", "specialty",
+    "n_periods", "n_choices", "n_unique_modules",
+    "avg_history_priority", "is_cold",
+    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
+    "pop_by_specialty",
+    "pop_last_period", "pop_prev_period", "pop_first_period",
+    "n_periods_available", "title_len", "desc_len",
+    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
+    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
+    "tfidf_cos_mean", "tfidf_cos_max",
+    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
+    "n_available", "was_available_before",
+    "pop_rank_global",
+    "pop_rank_global_in_avail",
+]
+
+# v16: V11 − title_len − desc_len
+# Гипотеза: длины текста проксируют ID модуля (короткие title = узкие
+# специальные модули). Модель может overfit на этот прокси вместо
+# содержательного сигнала. Убираем — смотрим, улучшится ли warm.
+FEATURE_COLS_V16: list[str] = [
+    "institute", "specialty",
+    "n_periods", "n_choices", "n_unique_modules",
+    "avg_history_priority", "is_cold",
+    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
+    "pop_by_specialty",
+    "pop_last_period", "pop_prev_period", "pop_first_period",
+    "n_periods_available",
+    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
+    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
+    "tfidf_cos_mean", "tfidf_cos_max",
+    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
+    "n_available", "was_available_before",
+    "pop_rank_global",
+    "pop_rank_global_in_avail",
+    "pop_rank_global_frac",
+]
+
 FEATURE_SETS: dict[str, list[str]] = {
     "v4": FEATURE_COLS_V4,
     "v5": FEATURE_COLS_V5,
@@ -221,23 +224,41 @@ FEATURE_SETS: dict[str, list[str]] = {
     "v8": FEATURE_COLS_V8,
     "v11": FEATURE_COLS_V11,
     "v12": FEATURE_COLS_V12,
+    "v14": FEATURE_COLS_V14,
+    "v15": FEATURE_COLS_V15,
+    "v16": FEATURE_COLS_V16,
 }
 
-# Соответствие content_backend → какие feature-set'ы с ним совместимы.
 COMPATIBLE_FEATURE_SETS: dict[str, tuple[str, ...]] = {
-    "tfidf": ("v4", "v6", "v7", "v8", "v11", "v12"),
+    "tfidf": ("v4", "v6", "v7", "v8", "v11", "v12", "v14", "v15", "v16"),
     "embed": ("v5", "v6", "v8"),
-    "both":  ("v4", "v5", "v6", "v7", "v8", "v11", "v12"),
-    "none":  ("v4", "v7", "v11", "v12"),
+    "both":  ("v4", "v5", "v6", "v7", "v8", "v11", "v12", "v14", "v15", "v16"),
+    "none":  ("v4", "v7", "v11", "v12", "v14", "v15", "v16"),
 }
 
 CATEGORICAL_FEATS: list[str] = ["institute", "specialty"]
 
-# label_gain[i] = вес для label i
-LABEL_GAIN: list[float] = [0.0, 0.35, 0.45, 0.60, 0.80, 1.00]
+# ---------------------------------------------------------------------------
+# МЕТРИКА (не менять!)
+# ---------------------------------------------------------------------------
+# Веса приоритетов в НАСТОЯЩЕЙ метрике pNDCG@5. Совпадают с официальной
+# формулой. Используются в custom eval и pndcg5_eval.
+METRIC_WEIGHTS_BY_LABEL: np.ndarray = np.array(
+    [0.0, 0.35, 0.45, 0.60, 0.80, 1.00],
+    dtype=np.float64,
+)
 
-WEIGHTS_BY_LABEL: np.ndarray = np.array(LABEL_GAIN, dtype=np.float64)
+# Алиас для обратной совместимости.
+WEIGHTS_BY_LABEL: np.ndarray = METRIC_WEIGHTS_BY_LABEL
 
+# ---------------------------------------------------------------------------
+# LABEL_GAIN — ОТКАЧЕНО к каноничному (v47 показал: усиление 1.5 → регресс)
+# ---------------------------------------------------------------------------
+LABEL_GAIN: list[float] = [0.0, 0.35, 0.45, 0.60, 0.80, 1.0]
+
+# ---------------------------------------------------------------------------
+# Параметры LightGBM (truncation=15 откачено)
+# ---------------------------------------------------------------------------
 DEFAULT_PARAMS: dict[str, Any] = {
     "objective": "lambdarank",
     "metric": "None",
@@ -257,7 +278,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
 
 
 # ---------------------------------------------------------------------------
-# Custom eval: наш pNDCG@5
+# Custom eval: pNDCG@5 (использует METRIC_WEIGHTS_BY_LABEL)
 # ---------------------------------------------------------------------------
 def _pndcg5_from_arrays(
     preds: np.ndarray,
@@ -318,9 +339,6 @@ def encode_categoricals(
     val_df: pd.DataFrame,
     cat_cols: list[str] = CATEGORICAL_FEATS,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Приводит категориальные колонки к общему набору категорий.
-    """
     for c in cat_cols:
         all_vals = sorted(set(train_df[c].astype(str)) | set(val_df[c].astype(str)))
         dtype = pd.CategoricalDtype(categories=all_vals)
@@ -336,7 +354,6 @@ def prepare_xyg(
     df: pd.DataFrame,
     feature_cols: list[str] = FEATURE_COLS,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame]:
-    """Сортирует по student_id, отделяет X, y, group."""
     df_sorted = df.sort_values("student_id", kind="stable").reset_index(drop=True)
     X = df_sorted[feature_cols].copy()
     y = df_sorted["label"].to_numpy(dtype=np.int32)
@@ -351,7 +368,6 @@ def prepare_xygw(
     weight_col: str = "weight",
     feature_cols: list[str] = FEATURE_COLS,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
-    """Как prepare_xyg, но возвращает ещё и веса."""
     df_sorted = df.sort_values("student_id", kind="stable").reset_index(drop=True)
     X = df_sorted[feature_cols].copy()
     y = df_sorted["label"].to_numpy(dtype=np.int32)
@@ -425,10 +441,6 @@ def predict_scores(
     df: pd.DataFrame,
     feature_cols: list[str] = FEATURE_COLS,
 ) -> np.ndarray:
-    """Возвращает массив score (float), выровненный по строкам df.
-
-    ВАЖНО: feature_cols должен совпадать с тем, на котором обучалась модель.
-    """
     X = df[feature_cols]
     return model.predict(X, num_iteration=model.best_iteration)
 
