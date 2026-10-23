@@ -1,20 +1,5 @@
 """
 LightGBM Ranker — основная LTR-модель.
-
-Использует objective='lambdarank' с кастомным label_gain и custom eval
-pndcg5_eval (наша метрика с clip-1.0).
-
-ДВЕ КОНЦЕПЦИИ (v47+):
-    * LABEL_GAIN — веса для lambdarank objective (градиенты).
-      v47 показал, что усиление priority-1 до 1.5 ВРЕДИТ (cold −0.031,
-      warm −0.006). Откат к каноничному [0, 0.35, 0.45, 0.60, 0.80, 1.0].
-    * METRIC_WEIGHTS_BY_LABEL — веса для custom eval и pndcg5_eval.
-      Должны совпадать с официальной метрикой. НЕЛЬЗЯ менять.
-
-Наборы признаков:
-    v4, v5, v6, v7, v8, v11, v12, v14 — основные
-    v15 = V11 − pop_rank_global_frac  (убрать дубль in_avail)
-    v16 = V11 − title_len − desc_len  (убрать прокси ID модуля)
 """
 from __future__ import annotations
 
@@ -27,193 +12,69 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# Наборы признаков
+# Группы фич — общие кирпичи для всех наборов
 # ---------------------------------------------------------------------------
-FEATURE_COLS: list[str] = [
+_GROUP_S_M_BASE = [
     "institute", "specialty",
     "n_periods", "n_choices", "n_unique_modules",
     "avg_history_priority", "is_cold",
     "pop_weighted_global", "pop_raw_global", "pop_by_institute",
-    "pop_by_specialty", "pop_period_1", "pop_period_2",
-    "n_periods_available", "title_len", "desc_len",
+    "pop_by_specialty",
+]
+_GROUP_PERIODS_ABS = ["pop_last_period", "pop_prev_period", "pop_first_period"]
+_GROUP_PERIODS_DELTA = ["pop_delta", "pop_delta_norm"]
+_GROUP_META = ["n_periods_available", "title_len", "desc_len"]
+_GROUP_COOC = [
     "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
     "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    "tfidf_cos_mean", "tfidf_cos_max",
+]
+_GROUP_TFIDF = ["tfidf_cos_mean", "tfidf_cos_max"]
+_GROUP_EMBED = ["embed_cos_mean", "embed_cos_max"]
+_GROUP_RANK_IN_AVAIL = [
     "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
-    "n_available", "was_available_before",
+]
+_GROUP_AVAIL = ["n_available", "was_available_before"]
+_GROUP_RANK_GLOBAL = [
+    "pop_rank_global", "pop_rank_global_in_avail", "pop_rank_global_frac",
 ]
 
-FEATURE_COLS_V4: list[str] = [
-    "institute", "specialty",
-    "n_periods", "n_choices", "n_unique_modules",
-    "avg_history_priority", "is_cold",
-    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
-    "pop_by_specialty",
-    "pop_last_period", "pop_prev_period", "pop_first_period",
-    "n_periods_available", "title_len", "desc_len",
-    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
-    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    "tfidf_cos_mean", "tfidf_cos_max",
-    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
-    "n_available", "was_available_before",
-]
 
-FEATURE_COLS_V5: list[str] = [
-    "institute", "specialty",
-    "n_periods", "n_choices", "n_unique_modules",
-    "avg_history_priority", "is_cold",
-    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
-    "pop_by_specialty",
-    "pop_last_period", "pop_prev_period", "pop_first_period",
-    "n_periods_available", "title_len", "desc_len",
-    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
-    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    "embed_cos_mean", "embed_cos_max",
-    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
-    "n_available", "was_available_before",
-]
+def _feats(*groups: list[str]) -> list[str]:
+    out: list[str] = []
+    for g in groups:
+        out.extend(g)
+    return out
 
-FEATURE_COLS_V6: list[str] = [
-    "institute", "specialty",
-    "n_periods", "n_choices", "n_unique_modules",
-    "avg_history_priority", "is_cold",
-    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
-    "pop_by_specialty",
-    "pop_last_period", "pop_prev_period", "pop_first_period",
-    "n_periods_available", "title_len", "desc_len",
-    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
-    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    "tfidf_cos_mean", "tfidf_cos_max",
-    "embed_cos_mean", "embed_cos_max",
-    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
-    "n_available", "was_available_before",
-]
 
-FEATURE_COLS_V7: list[str] = [
-    "institute", "specialty",
-    "n_periods", "n_choices", "n_unique_modules",
-    "avg_history_priority", "is_cold",
-    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
-    "pop_by_specialty",
-    "pop_last_period", "pop_prev_period", "pop_first_period",
-    "n_periods_available", "title_len", "desc_len",
-    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
-    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    "tfidf_cos_mean", "tfidf_cos_max",
-    "n_available", "was_available_before",
-]
+_HEAD = _feats(_GROUP_S_M_BASE, _GROUP_PERIODS_ABS, _GROUP_META, _GROUP_COOC)
+_HEAD_DELTA = _feats(
+    _GROUP_S_M_BASE, _GROUP_PERIODS_ABS, _GROUP_PERIODS_DELTA,
+    _GROUP_META, _GROUP_COOC,
+)
 
-FEATURE_COLS_V8: list[str] = [
-    "institute", "specialty",
-    "n_periods", "n_choices", "n_unique_modules",
-    "avg_history_priority", "is_cold",
-    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
-    "pop_by_specialty",
-    "pop_last_period", "pop_prev_period", "pop_first_period",
-    "n_periods_available", "title_len", "desc_len",
-    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
-    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    "tfidf_cos_mean", "tfidf_cos_max",
-    "embed_cos_mean", "embed_cos_max",
-    "n_available", "was_available_before",
-]
+# Legacy-база (pop_period_1/2 вместо pop_last/prev/first) — используется
+# как дефолт в prepare_xyg / prepare_xygw / predict_scores.
+FEATURE_COLS: list[str] = _feats(
+    _GROUP_S_M_BASE, ["pop_period_1", "pop_period_2"],
+    _GROUP_META, _GROUP_COOC, _GROUP_TFIDF,
+    _GROUP_RANK_IN_AVAIL, _GROUP_AVAIL,
+)
 
-FEATURE_COLS_V11: list[str] = [
-    "institute", "specialty",
-    "n_periods", "n_choices", "n_unique_modules",
-    "avg_history_priority", "is_cold",
-    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
-    "pop_by_specialty",
-    "pop_last_period", "pop_prev_period", "pop_first_period",
-    "n_periods_available", "title_len", "desc_len",
-    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
-    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    "tfidf_cos_mean", "tfidf_cos_max",
-    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
-    "n_available", "was_available_before",
-    "pop_rank_global",
-    "pop_rank_global_in_avail",
-    "pop_rank_global_frac",
-]
+FEATURE_COLS_V4 = _feats(_HEAD, _GROUP_TFIDF, _GROUP_RANK_IN_AVAIL, _GROUP_AVAIL)
+FEATURE_COLS_V5 = _feats(_HEAD, _GROUP_EMBED, _GROUP_RANK_IN_AVAIL, _GROUP_AVAIL)
+FEATURE_COLS_V6 = _feats(_HEAD, _GROUP_TFIDF, _GROUP_EMBED,
+                         _GROUP_RANK_IN_AVAIL, _GROUP_AVAIL)
+FEATURE_COLS_V7 = _feats(_HEAD, _GROUP_TFIDF, _GROUP_AVAIL)
+FEATURE_COLS_V8 = _feats(_HEAD, _GROUP_TFIDF, _GROUP_EMBED, _GROUP_AVAIL)
+FEATURE_COLS_V11 = _feats(_HEAD, _GROUP_TFIDF, _GROUP_RANK_IN_AVAIL,
+                          _GROUP_AVAIL, _GROUP_RANK_GLOBAL)
+FEATURE_COLS_V12 = _feats(_HEAD, _GROUP_TFIDF, _GROUP_AVAIL, _GROUP_RANK_GLOBAL)
+FEATURE_COLS_V14 = _feats(_HEAD_DELTA, _GROUP_TFIDF, _GROUP_RANK_IN_AVAIL,
+                          _GROUP_AVAIL, _GROUP_RANK_GLOBAL, ["pop_delta_rank"])
 
-FEATURE_COLS_V12: list[str] = [
-    "institute", "specialty",
-    "n_periods", "n_choices", "n_unique_modules",
-    "avg_history_priority", "is_cold",
-    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
-    "pop_by_specialty",
-    "pop_last_period", "pop_prev_period", "pop_first_period",
-    "n_periods_available", "title_len", "desc_len",
-    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
-    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    "tfidf_cos_mean", "tfidf_cos_max",
-    "n_available", "was_available_before",
-    "pop_rank_global",
-    "pop_rank_global_in_avail",
-    "pop_rank_global_frac",
-]
-
-FEATURE_COLS_V14: list[str] = [
-    "institute", "specialty",
-    "n_periods", "n_choices", "n_unique_modules",
-    "avg_history_priority", "is_cold",
-    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
-    "pop_by_specialty",
-    "pop_last_period", "pop_prev_period", "pop_first_period",
-    "pop_delta", "pop_delta_norm",
-    "n_periods_available", "title_len", "desc_len",
-    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
-    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    "tfidf_cos_mean", "tfidf_cos_max",
-    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
-    "n_available", "was_available_before",
-    "pop_rank_global",
-    "pop_rank_global_in_avail",
-    "pop_rank_global_frac",
-    "pop_delta_rank",
-]
-
-# v15: V11 − pop_rank_global_frac
-# Для фиксированного n_available (158/159) pop_rank_global_frac =
-# pop_rank_global_in_avail / n_available. Это ПОЛНЫЙ дубль (линейное
-# преобразование с константой). Одна из двух фич избыточна.
-FEATURE_COLS_V15: list[str] = [
-    "institute", "specialty",
-    "n_periods", "n_choices", "n_unique_modules",
-    "avg_history_priority", "is_cold",
-    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
-    "pop_by_specialty",
-    "pop_last_period", "pop_prev_period", "pop_first_period",
-    "n_periods_available", "title_len", "desc_len",
-    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
-    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    "tfidf_cos_mean", "tfidf_cos_max",
-    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
-    "n_available", "was_available_before",
-    "pop_rank_global",
-    "pop_rank_global_in_avail",
-]
-
-# v16: V11 − title_len − desc_len
-# Гипотеза: длины текста проксируют ID модуля (короткие title = узкие
-# специальные модули). Модель может overfit на этот прокси вместо
-# содержательного сигнала. Убираем — смотрим, улучшится ли warm.
-FEATURE_COLS_V16: list[str] = [
-    "institute", "specialty",
-    "n_periods", "n_choices", "n_unique_modules",
-    "avg_history_priority", "is_cold",
-    "pop_weighted_global", "pop_raw_global", "pop_by_institute",
-    "pop_by_specialty",
-    "pop_last_period", "pop_prev_period", "pop_first_period",
-    "n_periods_available",
-    "already_chosen", "cooc_score", "cooc_max", "cooc_norm",
-    "cooc_ppmi_score", "cooc_ppmi_max", "cooc_ppmi_norm",
-    "tfidf_cos_mean", "tfidf_cos_max",
-    "pop_ratio_in_institute", "pop_rank_in_available", "pop_rank_frac",
-    "n_available", "was_available_before",
-    "pop_rank_global",
-    "pop_rank_global_in_avail",
-    "pop_rank_global_frac",
+FEATURE_COLS_V15 = [f for f in FEATURE_COLS_V11 if f != "pop_rank_global_frac"]
+FEATURE_COLS_V16 = [
+    f for f in FEATURE_COLS_V11 if f not in ("title_len", "desc_len")
 ]
 
 FEATURE_SETS: dict[str, list[str]] = {
@@ -239,10 +100,8 @@ COMPATIBLE_FEATURE_SETS: dict[str, tuple[str, ...]] = {
 CATEGORICAL_FEATS: list[str] = ["institute", "specialty"]
 
 # ---------------------------------------------------------------------------
-# МЕТРИКА (не менять!)
+# МЕТРИКА (не менять! совпадает с официальной формулой)
 # ---------------------------------------------------------------------------
-# Веса приоритетов в НАСТОЯЩЕЙ метрике pNDCG@5. Совпадают с официальной
-# формулой. Используются в custom eval и pndcg5_eval.
 METRIC_WEIGHTS_BY_LABEL: np.ndarray = np.array(
     [0.0, 0.35, 0.45, 0.60, 0.80, 1.00],
     dtype=np.float64,
@@ -251,14 +110,9 @@ METRIC_WEIGHTS_BY_LABEL: np.ndarray = np.array(
 # Алиас для обратной совместимости.
 WEIGHTS_BY_LABEL: np.ndarray = METRIC_WEIGHTS_BY_LABEL
 
-# ---------------------------------------------------------------------------
-# LABEL_GAIN — ОТКАЧЕНО к каноничному (v47 показал: усиление 1.5 → регресс)
-# ---------------------------------------------------------------------------
+# LABEL_GAIN — каноничный (v47 показал: усиление 1.5 → регресс).
 LABEL_GAIN: list[float] = [0.0, 0.35, 0.45, 0.60, 0.80, 1.0]
 
-# ---------------------------------------------------------------------------
-# Параметры LightGBM (truncation=15 откачено)
-# ---------------------------------------------------------------------------
 DEFAULT_PARAMS: dict[str, Any] = {
     "objective": "lambdarank",
     "metric": "None",
@@ -277,9 +131,6 @@ DEFAULT_PARAMS: dict[str, Any] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Custom eval: pNDCG@5 (использует METRIC_WEIGHTS_BY_LABEL)
-# ---------------------------------------------------------------------------
 def _pndcg5_from_arrays(
     preds: np.ndarray,
     labels: np.ndarray,
@@ -331,9 +182,6 @@ def pndcg5_eval(
     return "pndcg@5", score, True
 
 
-# ---------------------------------------------------------------------------
-# Кодирование категориальных
-# ---------------------------------------------------------------------------
 def encode_categoricals(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -347,9 +195,6 @@ def encode_categoricals(
     return train_df, val_df
 
 
-# ---------------------------------------------------------------------------
-# Подготовка X, y, group, w
-# ---------------------------------------------------------------------------
 def prepare_xyg(
     df: pd.DataFrame,
     feature_cols: list[str] = FEATURE_COLS,
@@ -381,9 +226,6 @@ def prepare_xygw(
     return X, y, group_sizes, w, df_sorted
 
 
-# ---------------------------------------------------------------------------
-# Обучение
-# ---------------------------------------------------------------------------
 def train_lgbm_ranker(
     X_train: pd.DataFrame,
     y_train: np.ndarray,
@@ -433,9 +275,6 @@ def train_lgbm_ranker(
     return booster
 
 
-# ---------------------------------------------------------------------------
-# Предсказание
-# ---------------------------------------------------------------------------
 def predict_scores(
     model: lgb.Booster,
     df: pd.DataFrame,
@@ -469,9 +308,6 @@ def top_k_per_student(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Feature importance
-# ---------------------------------------------------------------------------
 def feature_importance_report(
     model: lgb.Booster,
     feature_cols: list[str] = FEATURE_COLS,
@@ -487,9 +323,6 @@ def feature_importance_report(
     return df.head(top_n)
 
 
-# ---------------------------------------------------------------------------
-# Сохранение / загрузка
-# ---------------------------------------------------------------------------
 def save_model(model: lgb.Booster, path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

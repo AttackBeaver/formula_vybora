@@ -1,27 +1,13 @@
 """
 run_ltr_v42.py — эксперименты в V11-семье с выбором feature-set.
 
-ОСИ:
-    --feature-set NAME        любой из FEATURE_SETS (v4, v5, v6, v7, v8,
-                              v11, v12, v14, v15, v16)
+Оси:
+    --feature-set NAME        любой из FEATURE_SETS (v4..v16)
     --weight-p0mask FLOAT     вес p0_mask-среза (default 0.0 = как v41)
                               ВНИМАНИЕ: p0mask на cold ломает test (v43).
-                              Использовать только для warm-экспериментов.
+                              Только для warm-экспериментов.
     --weight-p2 FLOAT         вес p2-среза (default 3.0 = как v41)
-    --drop-global-rank-in-avail  исключить pop_rank_global_in_avail
-
-ЗАПУСК:
-    # контроль: v41-реплика
-    python -m src.run_ltr_v42 --feature-set v11 --n-seeds 5
-    # ablation: без pop_rank_global_frac
-    python -m src.run_ltr_v42 --feature-set v15 --n-seeds 3
-    # ablation: без title_len/desc_len
-    python -m src.run_ltr_v42 --feature-set v16 --n-seeds 3
-
-РЕШЕНИЕ О САБМИТЕ (raw-LTR на cold, без fallback):
-    cold raw ≥ 0.337 (не хуже v41) И warm raw ≥ 0.487 (лучше v41)  →  сабмит
-    cold raw ≥ 0.337 И warm raw ∈ [0.483, 0.487]                  →  на грани
-    cold raw < 0.337 или warm raw < 0.483                         →  не сабмит
+    --drop-global-rank-in-avail
 """
 from __future__ import annotations
 
@@ -188,12 +174,12 @@ def main() -> None:
     val_solution = data["val_solution"]
     val_gt_raw = dict(zip(val_solution["id"], val_solution["ground_truth"]))
 
-    # ==== 1. FeatureStats ====
+    # 1. FeatureStats
     print(f"\n[1/8] FeatureStats (content='{CONTENT_BACKEND}')...")
     stats = FeatureStats.fit(train, modules, content_backend=CONTENT_BACKEND)
     stats.add_val_solution_popularity(val_solution)
 
-    # ==== 2. Train-срезы ====
+    # 2. Train-срезы
     print("\n[2/8] Train-срезы...")
     train_students_p1 = [
         s for s in train
@@ -238,7 +224,7 @@ def main() -> None:
         parts_log += f"  p0_mask={len(train_df_p0mask):,}"
     print(f"      {parts_log}")
 
-    # ==== 3. Holdout + p2 ====
+    # 3. Holdout + p2
     print("\n[3/8] Holdout + p2-срез...")
     val_p2 = [s for s in val if _n_periods(s) == 2]
     rng = random.Random(HOLDOUT_SEED)
@@ -263,7 +249,7 @@ def main() -> None:
         past_periods=[1, 2],
     )
 
-    # ==== 4. Val и test ====
+    # 4. Val и test
     print("\n[4/8] Val и test датасеты...")
     val_df = build_dataset(
         val, stats,
@@ -280,7 +266,7 @@ def main() -> None:
     )
     print(f"      val={len(val_df):,}  test={len(test_df):,}")
 
-    # ==== 5. Сборка + кодирование ====
+    # 5. Сборка + кодирование
     print("\n[5/8] Сборка + единый словарь категорий...")
     train_df_p1 = _add_weight(train_df_p1, WEIGHT_P1)
     train_df_p0 = _add_weight(train_df_p0, WEIGHT_P0)
@@ -317,7 +303,7 @@ def main() -> None:
     val_df = all_df.iloc[n_tr + n_ho:n_tr + n_ho + n_va].reset_index(drop=True)
     test_df = all_df.iloc[n_tr + n_ho + n_va:].reset_index(drop=True)
 
-    # ==== 6. Матрицы ====
+    # 6. Матрицы
     print("\n[6/8] Матрицы X, y, g, w...")
     X_train, y_train, g_train, w_train, _ = prepare_xygw(
         train_df, feature_cols=feature_cols)
@@ -329,7 +315,7 @@ def main() -> None:
     print(f"      Train X={X_train.shape}, групп={len(g_train)}, "
           f"w_mean={w_train.mean():.3f}")
 
-    # ==== 7. Multi-seed ====
+    # 7. Multi-seed
     print(f"\n[7/8] Обучение {n_seeds} моделей...")
     scores_ho_list: list[np.ndarray] = []
     scores_val_list: list[np.ndarray] = []
@@ -372,7 +358,7 @@ def main() -> None:
     model_name = f"lgbm_ranker_v42_{tag}.txt"
     save_model(last_model, MODELS_DIR / model_name)
 
-    # ==== 8. Оценка ====
+    # 8. Оценка
     print("\n[8/8] Оценка...")
 
     rec_ho = top_k_per_student(ho_sorted, scores_ho, k=5)
@@ -403,7 +389,6 @@ def main() -> None:
     for _, row in imp.iterrows():
         print(f"      {row['feature']:<30}  gain = {row['gain']:>12.0f}")
 
-    # ==== Вердикт ====
     print("\n" + "=" * 78)
     print(f"ИТОГ: feature={feature_set}, p2={weight_p2}, p0mask={weight_p0mask}")
     print("=" * 78)
@@ -413,14 +398,14 @@ def main() -> None:
     print()
 
     if cold_ltr >= 0.337 and warm_ltr >= 0.487:
-        print(f"  ✅ РЕКОМЕНДАЦИЯ: cold {cold_ltr:.4f}≥0.337, warm "
+        print(f" РЕКОМЕНДАЦИЯ: cold {cold_ltr:.4f}≥0.337, warm "
               f"{warm_ltr:.4f}≥0.487 — КАНДИДАТ на сабмит")
         print(f"     файл: {test_path.name}")
     elif cold_ltr >= 0.337 and warm_ltr >= 0.483:
-        print(f"  ⚠️  ОСТОРОЖНО: cold {cold_ltr:.4f}≥0.337, warm "
+        print(f" ОСТОРОЖНО: cold {cold_ltr:.4f}≥0.337, warm "
               f"{warm_ltr:.4f} ∈ [0.483, 0.487) — на грани")
     else:
-        print(f"  ❌ НЕ САБМИТИМ: cold {cold_ltr:.4f} или warm {warm_ltr:.4f} "
+        print(f" НЕ САБМИТИМ: cold {cold_ltr:.4f} или warm {warm_ltr:.4f} "
               f"не дотягивают")
     print("=" * 78)
     print(f"\n[OK] завершён за {time.time() - t0:.1f} сек.")

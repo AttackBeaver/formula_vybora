@@ -1,32 +1,7 @@
 """
 run_ltr_v41.py — v40 с выбором feature-set (V4 или V11).
 
-ГИПОТЕЗА:
-    v7 (V4, p2=3.0) = 0.3240 — champion.
-    v39 (V11, без p2) = 0.3142 — регресс, но в honest V11 выигрывал у V4
-    на обоих сегментах (cold 0.2409 vs 0.2232, p2 0.3841 vs 0.3796).
-    v40 (V4, p2=7.0) = 0.3205 — регресс, holdout не переносится.
-
-    НЕ проверено: V11 С p2-срезом. Три сигнала вместе:
-        * rank-3 (V4-семья) — держат cold и warm;
-        * глобальные rank (V11) — добавляют независимый ранг;
-        * p2-срез — warm-transfer (даже если holdout обманывает).
-
-    Если на public V11 + p2 выиграет у V4 + p2 — значит rank-фичи
-    переносятся. Если нет — v7 финальный чемпион, идём в feature ablation.
-
-ПАРАМЕТРЫ:
-    --feature-set {v4,v11}   (default v11 — эксперимент)
-    --weight-p2 FLOAT        (default 3.0)
-    --n-seeds INT            (default 5)
-
-ЗАПУСК:
-    python -m src.run_ltr_v41 --feature-set v11 --weight-p2 3.0
-    python -m src.run_ltr_v41 --feature-set v4  --weight-p2 3.0   # контроль
-
-РЕШЕНИЕ О САБМИТЕ:
-    holdout ≥ 0.515 И pop_rank_global* в топ-5 importance  →  сабмит
-    holdout < 0.510                                        →  не сабмит
+Решение о сабмите: holdout ≥ 0.515 И pop_rank_global* в топ-5 importance.
 """
 from __future__ import annotations
 
@@ -161,12 +136,12 @@ def main() -> None:
     val_solution = data["val_solution"]
     val_gt_raw = dict(zip(val_solution["id"], val_solution["ground_truth"]))
 
-    # ==== 1. FeatureStats ====
+    # 1. FeatureStats
     print(f"\n[1/8] FeatureStats (content_backend='{CONTENT_BACKEND}')...")
     stats = FeatureStats.fit(train, modules, content_backend=CONTENT_BACKEND)
     stats.add_val_solution_popularity(val_solution)
 
-    # ==== 2. Train-срезы ====
+    # 2. Train-срезы
     print("\n[2/8] Train-срезы...")
     train_students_p1 = [
         s for s in train
@@ -199,7 +174,7 @@ def main() -> None:
     print(f"      p1={len(train_df_p1):,}  p0={len(train_df_p0):,}  "
           f"pmask={len(train_df_pmask):,}")
 
-    # ==== 3. Holdout + p2 ====
+    # 3. Holdout + p2
     print("\n[3/8] Holdout + p2-срез...")
     val_p2 = [s for s in val if _n_periods(s) == 2]
     rng = random.Random(HOLDOUT_SEED)
@@ -224,7 +199,7 @@ def main() -> None:
         past_periods=[1, 2],
     )
 
-    # ==== 4. Val и test ====
+    # 4. Val и test
     print("\n[4/8] Val и test датасеты...")
     val_df = build_dataset(
         val, stats,
@@ -241,7 +216,7 @@ def main() -> None:
     )
     print(f"      val={len(val_df):,}  test={len(test_df):,}")
 
-    # ==== 5. Сборка ====
+    # 5. Сборка + единый словарь категорий
     print("\n[5/8] Сборка + единый словарь категорий...")
     train_df_p1 = _add_weight(train_df_p1, WEIGHT_P1)
     train_df_p0 = _add_weight(train_df_p0, WEIGHT_P0)
@@ -273,7 +248,7 @@ def main() -> None:
     val_df = all_df.iloc[n_tr + n_ho:n_tr + n_ho + n_va].reset_index(drop=True)
     test_df = all_df.iloc[n_tr + n_ho + n_va:].reset_index(drop=True)
 
-    # ==== 6. Матрицы ====
+    # 6. Матрицы
     print("\n[6/8] Подготовка X, y, g, w...")
     X_train, y_train, g_train, w_train, _ = prepare_xygw(
         train_df, feature_cols=feature_cols)
@@ -287,7 +262,7 @@ def main() -> None:
           f"w_mean={w_train.mean():.3f}")
     print(f"      Holdout: X={X_ho.shape}, групп={len(g_ho)}")
 
-    # ==== 7. Multi-seed ====
+    # 7. Multi-seed
     print(f"\n[7/8] Обучение {n_seeds} моделей...")
     scores_ho_list: list[np.ndarray] = []
     scores_val_list: list[np.ndarray] = []
@@ -330,7 +305,7 @@ def main() -> None:
 
     save_model(last_model, MODELS_DIR / f"lgbm_ranker_v41_{tag}.txt")
 
-    # ==== 8. Оценка ====
+    # 8. Оценка holdout + val
     print("\n[8/8] Оценка holdout + val:")
 
     rec_ho = top_k_per_student(ho_sorted, scores_ho, k=5)
@@ -396,7 +371,6 @@ def main() -> None:
                 global_rank_in_top5 += 1
         print(f"      {row['feature']:<28}  gain = {row['gain']:>12.0f}{star}")
 
-    # ==== Вердикт ====
     print("\n" + "=" * 78)
     print(f"ИТОГ: feature={feature_set}, p2={weight_p2}")
     print("=" * 78)
@@ -406,10 +380,10 @@ def main() -> None:
     print(f"  warm raw           = {warm_ltr:.4f}")
     print(f"  pop_rank_global* в топ-5 importance: {global_rank_in_top5}/3")
     print()
-    print(f"  Ориентиры:")
-    print(f"    v7 (V4, p2=3.0)        public = 0.3240")
-    print(f"    v40 (V4, p2=7.0)       public = 0.3205")
-    print(f"    v39 (V11, без p2)      public = 0.3142")
+    print("  Ориентиры:")
+    print("    v7 (V4, p2=3.0)        public = 0.3240")
+    print("    v40 (V4, p2=7.0)       public = 0.3205")
+    print("    v39 (V11, без p2)      public = 0.3142")
     print()
     if feature_set == "v11":
         if mean_ho >= 0.515 and global_rank_in_top5 >= 2:

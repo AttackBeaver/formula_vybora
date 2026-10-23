@@ -1,15 +1,8 @@
 """
 Content-based features: TF-IDF косинус между описаниями дисциплин.
 
-Идея: если в истории студента есть модули определённой тематики
-(например, психология, педагогика), вероятно, он выберет похожие по теме
-модули в будущем.
-
-Реализация:
-    1. Обучаем TfidfVectorizer на текстах модулей (title + description).
-    2. Получаем L2-нормализованную матрицу M [n_modules × V].
-    3. Профиль студента = усреднённый вектор модулей из истории, L2-норм.
-    4. Косинус между профилем и кандидатом = скалярное произведение.
+Профиль студента = усреднённый L2-норм вектор модулей истории,
+косинус с кандидатом = скалярное произведение.
 """
 from __future__ import annotations
 
@@ -35,16 +28,12 @@ class ContentModel:
         model.module_ids = [m["module_id"] for m in modules]
         model.module_to_idx = {mid: i for i, mid in enumerate(model.module_ids)}
 
-        # Тексты: title + description объединяем через точку,
-        # чтобы TF-IDF не склеивал границы предложений.
+        # Точка между title и description — чтобы TF-IDF не склеивал границы.
         texts = [
             f"{m.get('title') or ''}. {m.get('description') or ''}"
             for m in modules
         ]
 
-        # Sublinear TF: log(1 + tf) — гасит «шумные» частые слова внутри описания.
-        # ngram_range=(1,1) — только одиночные слова. Биграммы дали бы больше
-        # точности, но и больше разреженности; для 322 модулей одиночные слова ок.
         model.vectorizer = TfidfVectorizer(
             max_features=8000,
             min_df=2,
@@ -54,16 +43,12 @@ class ContentModel:
         )
         matrix = model.vectorizer.fit_transform(texts)  # [n_modules, V], sparse
         matrix_norm = normalize(matrix, norm="l2", axis=1)
-        # Плотная матрица 322×8000×4 байта = ~10 МБ, влезает.
+        # Плотная 322×8000×4 байта ≈ 10 МБ — влезает.
         model.vectors = matrix_norm.toarray().astype(np.float32)
         return model
 
-    # -----------------------------------------------------------------------
     def student_profile_mean(self, history_modules: list[str]) -> np.ndarray | None:
-        """
-        L2-нормализованный средний вектор истории.
-        Возвращает None, если истории нет.
-        """
+        """L2-норм средний вектор истории; None, если истории нет."""
         idxs = [self.module_to_idx[mid] for mid in history_modules if mid in self.module_to_idx]
         if not idxs:
             return None
@@ -73,15 +58,12 @@ class ContentModel:
             return None
         return (mean_vec / norm).astype(np.float32)
 
-    # -----------------------------------------------------------------------
     def cosine_mean(
         self,
         profile: np.ndarray | None,
         candidate_ids: list[str],
     ) -> np.ndarray:
-        """
-        Косинус между усреднённым профилем и каждым кандидатом.
-        """
+        """Косинус между усреднённым профилем и каждым кандидатом."""
         if profile is None:
             return np.zeros(len(candidate_ids), dtype=np.float32)
         idxs = [self.module_to_idx.get(mid, -1) for mid in candidate_ids]
@@ -94,7 +76,6 @@ class ContentModel:
         sims[row_idxs] = self.vectors[cand_idxs] @ profile
         return sims
 
-    # -----------------------------------------------------------------------
     def cosine_max(
         self,
         history_modules: list[str],
@@ -102,7 +83,7 @@ class ContentModel:
     ) -> np.ndarray:
         """
         Максимальный косинус между кандидатом и каждым модулем истории.
-        Более острый сигнал: ловит «хотя бы одну» похожую тему.
+        Острее, чем cosine_mean: ловит «хотя бы одну» похожую тему.
         """
         idxs_h = [
             self.module_to_idx[mid]

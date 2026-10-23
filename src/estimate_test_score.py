@@ -1,23 +1,5 @@
 """
-estimate_test_score.py — композиционно-корректная оценка public.
-
-ЗАЧЕМ:
-    Наивная оценка в run_ltr_v* берёт warm = среднее по ВСЕМ warm-val
-    студентам. Но в val warm на 50.3% состоит из val_p1 (лёгкий сегмент,
-    ~0.55), а в test доля p1 во всём множестве = 2%. Значит, наивная
-    оценка систематически завышена.
-
-    Правильные веса test (из ТЗ):
-        cold = 0.352
-        p1   = 0.020
-        p2   = 0.324
-        p3   = 0.304   ← proxy = val_p2, т.к. после max_history_periods=2
-                         test_p3 структурно совпадает с val_p2
-                         (2 периода истории → предсказать 3-й).
-
-ИСПОЛЬЗОВАНИЕ:
-    python -m src.estimate_test_score submissions/val_submission_ltr_v29.csv
-    python -m src.estimate_test_score submissions/val_submission_ltr_v7.csv
+Композиционно-корректная оценка public-score на val.
 """
 from __future__ import annotations
 
@@ -31,7 +13,8 @@ from src.cold_start import identify_cold_students
 from src.data_loader import load_all
 from src.metric import evaluate_pndcg5
 
-# Доли сегментов в test (из ТЗ, § 2).
+# Доли сегментов в test из ТЗ. p3 ≈ val_p2: после max_history_periods=2
+# test_p3 структурно совпадает с val_p2 (2 периода истории → предсказать 3-й).
 TEST_SHARES: dict[str, float] = {
     "cold": 0.352,
     "p1":   0.020,
@@ -41,9 +24,9 @@ TEST_SHARES: dict[str, float] = {
 
 
 def read_submission(path: Path) -> dict[str, list[str]]:
-    """Читает CSV-сабмит, возвращает {student_id: [module_id, ...]}.
+    """Читает CSV-сабмит → {student_id: [module_id, ...]}.
 
-    Поддерживает форматы:
+    Поддерживаемые форматы:
         * ('id', 'recommendations')      — модули через пробел/запятую
         * ('id', 'prediction')           — модули через пробел
         * ('id', 'module_1'..'module_5') — по колонке на позицию
@@ -60,7 +43,6 @@ def read_submission(path: Path) -> dict[str, list[str]]:
     if id_col is None:
         raise ValueError(f"Нет колонки с id. Колонки: {cols}")
 
-    # --- Формат "одна текстовая колонка с рекомендациями" ---
     for cand in ("recommendations", "prediction", "recommendation", "top5"):
         if cand in cols:
             rec: dict[str, list[str]] = {}
@@ -68,12 +50,10 @@ def read_submission(path: Path) -> dict[str, list[str]]:
                 if pd.isna(raw):
                     rec[str(sid)] = []
                     continue
-                # Разделители: пробел, запятая, точка с запятой, '|'.
                 s = str(raw).replace(",", " ").replace(";", " ").replace("|", " ")
                 rec[str(sid)] = [tok for tok in s.split() if tok]
             return rec
 
-    # --- Формат "module_1".."module_k" ---
     mod_cols = sorted(c for c in cols if c.startswith("module_"))
     if mod_cols:
         rec = {}
@@ -149,7 +129,6 @@ def main() -> None:
         seg_means[name] = m
         print(f"  {name:<5}: n={n:>4}  pNDCG@5 = {m:.4f}")
 
-    # p3 проксируется val_p2.
     est_correct = (
         TEST_SHARES["cold"] * seg_means["cold"]
         + TEST_SHARES["p1"] * seg_means["p1"]

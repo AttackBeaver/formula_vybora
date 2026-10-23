@@ -1,12 +1,8 @@
 """
-Модуль загрузки данных для хакатона "Формула выбора".
+Загрузка данных.
 
-Отвечает за:
-- чтение JSONL и CSV файлов;
-- кэширование в pickle (чтобы не парсить JSON каждый раз);
-- базовую валидацию структуры данных.
+JSONL/CSV + pickle-кэш + диагностика структуры.
 
-Использование:
     from src.data_loader import load_all, print_summary
     data = load_all()
     print_summary(data)
@@ -21,33 +17,17 @@ from typing import Any
 
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Пути
-# ---------------------------------------------------------------------------
-# __file__        = .../formula_vybora/src/data_loader.py
-# .parent         = .../formula_vybora/src
-# .parent.parent  = .../formula_vybora
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 CACHE_DIR = DATA_DIR / "_cache"
 
 
-# ---------------------------------------------------------------------------
-# Базовое чтение JSONL
-# ---------------------------------------------------------------------------
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     """
-    Читает JSONL-файл: один JSON-объект на строку.
-
-    Args:
-        path: путь к .jsonl файлу.
-
-    Returns:
-        Список словарей (каждая строка — dict).
+    Читает JSONL (один JSON на строку).
 
     Raises:
-        FileNotFoundError: если файла нет.
-        ValueError: если в строке битый JSON (с указанием номера строки).
+        FileNotFoundError, ValueError (с номером строки при битом JSON).
     """
     if not path.exists():
         raise FileNotFoundError(
@@ -59,7 +39,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
-            if not line:                # пропускаем пустые строки
+            if not line:
                 continue
             try:
                 records.append(json.loads(line))
@@ -70,9 +50,6 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-# ---------------------------------------------------------------------------
-# Публичные функции загрузки
-# ---------------------------------------------------------------------------
 def load_train() -> list[dict[str, Any]]:
     """История выбора дисциплин за первые два периода."""
     return _read_jsonl(DATA_DIR / "train.jsonl")
@@ -103,22 +80,18 @@ def load_sample_submission() -> pd.DataFrame:
     return pd.read_csv(DATA_DIR / "sample_submission.csv")
 
 
-# ---------------------------------------------------------------------------
-# Кэширование (pickle)
-# ---------------------------------------------------------------------------
 def _cache_path(name: str) -> Path:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     return CACHE_DIR / f"{name}.pkl"
 
 
 def save_cache(obj: Any, name: str) -> None:
-    """Сохраняет объект в pickle-файл."""
     with _cache_path(name).open("wb") as f:
         pickle.dump(obj, f)
 
 
 def load_cache(name: str) -> Any:
-    """Загружает объект из pickle-файла. None, если кэша нет."""
+    """Возвращает None, если кэша нет."""
     path = _cache_path(name)
     if not path.exists():
         return None
@@ -126,20 +99,12 @@ def load_cache(name: str) -> Any:
         return pickle.load(f)
 
 
-# ---------------------------------------------------------------------------
-# Загрузка всего сразу (с кэшем)
-# ---------------------------------------------------------------------------
 def load_all(use_cache: bool = True, force_reload: bool = False) -> dict[str, Any]:
     """
-    Загружает все данные проекта.
+    Загружает всё и кэширует в pickle.
 
-    Args:
-        use_cache: если True и кэш есть — берёт из pickle.
-        force_reload: если True — игнорирует кэш и перечитывает JSONL.
-
-    Returns:
-        Словарь с ключами:
-            train, val, test, modules, val_solution, sample_submission
+    Ключи результата: train, val, test, modules, val_solution, sample_submission.
+    force_reload игнорирует кэш.
     """
     cache_name = "all_data"
     if use_cache and not force_reload:
@@ -163,11 +128,8 @@ def load_all(use_cache: bool = True, force_reload: bool = False) -> dict[str, An
     return data
 
 
-# ---------------------------------------------------------------------------
-# Диагностика: печатаем базовую статистику
-# ---------------------------------------------------------------------------
 def _example_student(record: dict[str, Any]) -> str:
-    """Красиво печатает одного студента (обрезка длинных полей)."""
+    """Печатает одного студента с обрезкой длинных полей."""
     rec = dict(record)
     if "history" in rec:
         rec["history"] = [
@@ -187,7 +149,6 @@ def _example_student(record: dict[str, Any]) -> str:
 
 
 def print_summary(data: dict[str, Any]) -> None:
-    """Печатает ключевую статистику по всем файлам."""
     train = data["train"]
     val = data["val"]
     test = data["test"]
@@ -199,7 +160,6 @@ def print_summary(data: dict[str, Any]) -> None:
     print("СВОДКА ПО ДАННЫМ")
     print("=" * 70)
 
-    # --- размеры ---
     print("\n[Размеры]")
     print(f"  train:            {len(train):>7} студентов")
     print(f"  val:              {len(val):>7} студентов")
@@ -208,26 +168,21 @@ def print_summary(data: dict[str, Any]) -> None:
     print(f"  val_solution:     {len(val_sol):>7} строк")
     print(f"  sample_submission:{len(sample_sub):>7} строк")
 
-    # --- ключи первого студента в каждом файле ---
     print("\n[Ключи первого студента]")
     print(f"  train[0].keys():   {list(train[0].keys())}")
     print(f"  val[0].keys():     {list(val[0].keys())}")
     print(f"  test[0].keys():    {list(test[0].keys())}")
     print(f"  modules[0].keys(): {list(modules[0].keys())}")
 
-    # --- пример одного студента из train ---
     print("\n[Пример train[0]]")
     print(_example_student(train[0]))
 
-    # --- пример одного студента из val ---
     print("\n[Пример val[0]]")
     print(_example_student(val[0]))
 
-    # --- пример модуля ---
     print("\n[Пример modules[0]]")
     print(json.dumps(modules[0], ensure_ascii=False, indent=2))
 
-    # --- статистика по history ---
     print("\n[История выбора в train]")
     n_periods = [len(s.get("history", [])) for s in train]
     n_choices = [
@@ -250,7 +205,6 @@ def print_summary(data: dict[str, Any]) -> None:
     )
     print(f"  Распределение приоритетов: {dict(sorted(Counter(priorities).items()))}")
 
-    # --- холодные пользователи в test ---
     print("\n[Холодный старт]")
 
     def is_cold(rec: dict[str, Any]) -> bool:
@@ -271,7 +225,6 @@ def print_summary(data: dict[str, Any]) -> None:
         f"({100 * n_cold_val / len(val):.1f}%)"
     )
 
-    # --- available_modules ---
     if val and "available_modules" in val[0]:
         n_avail = [len(s.get("available_modules", [])) for s in val]
         print("\n[available_modules в val]")
@@ -280,16 +233,12 @@ def print_summary(data: dict[str, Any]) -> None:
             f"avg={sum(n_avail)/len(n_avail):.1f}"
         )
 
-    # --- val_solution пример ---
     print("\n[Пример val_solution]")
     print(val_sol.head(3).to_string(index=False))
 
     print("\n" + "=" * 70)
 
 
-# ---------------------------------------------------------------------------
-# CLI: python -m src.data_loader
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     data = load_all(use_cache=True, force_reload=False)
     print_summary(data)

@@ -1,43 +1,5 @@
 """
 KFold-evaluator: честная метрика на warm-val + cold-val.
-
-ЗАЧЕМ:
-    Старый holdout (284 val_p2) шумит ±0.0075. Все приросты v10-v25 были
-    в пределах шума. KFold даёт шум ±0.0023 — в 3 раза точнее.
-
-КАК:
-    5-fold по всем warm-val студентам (val_p1 + val_p2 = 2955).
-    На каждом фолде:
-        - 80% warm-val → обучающие срезы valp1/valp2 (с фиксированным весом).
-        - 20% warm-val → OOF-holdout.
-    Train p0/p1/pmask — фиксированные, всегда в обучении.
-    Cold-val (88) — оценивается через global pop (fallback отключён).
-
-    Composite = 0.352 × cold + 0.648 × warm_OOF.
-
-ПАРАМЕТРЫ:
-    --apply-fix {0,1}          — перезаписывать pop_last/prev/first по истинным периодам (default 1)
-    --weight-valp1 FLOAT       — вес val_p1 в обучении (0 = отключить, default 1.0)
-    --weight-p2 FLOAT          — вес val_p2 в обучении (default 3.0)
-    --n-seeds INT              — seeds на фолд (default 1)
-    --n-folds INT              — число фолдов (default 5)
-    --content-backend {tfidf,embed,both,none}
-                               — какой content-сигнал считать (default tfidf)
-    --feature-set {v4,v5,v6}   — какой набор признаков подавать в LightGBM (default v4)
-
-ПРИМЕРЫ:
-    # v7-baseline (TF-IDF + v4)
-    python -m src.kfold_eval
-
-    # v29a: embeddings вместо TF-IDF
-    python -m src.kfold_eval --content-backend embed --feature-set v5
-
-    # v29b: оба content-сигнала
-    python -m src.kfold_eval --content-backend both --feature-set v6
-
-    # Проверка: несовместимые комбинации падают с ошибкой
-    python -m src.kfold_eval --content-backend tfidf --feature-set v5
-        → ERROR: feature_set='v5' требует content_backend ∈ {'embed','both'}
 """
 from __future__ import annotations
 
@@ -232,7 +194,6 @@ def _prepare_static_slices(
 
 
 def _validate_combo(content_backend: str, feature_set: str) -> None:
-    """Проверяет, что feature_set совместим с content_backend."""
     if feature_set not in FEATURE_SETS:
         raise ValueError(
             f"feature_set={feature_set!r}, ожидалось одно из "
@@ -271,7 +232,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Ранняя валидация: несовместимая пара — сразу ошибка.
     try:
         _validate_combo(args.content_backend, args.feature_set)
     except ValueError as e:
@@ -289,7 +249,7 @@ def main() -> None:
     content_backend = args.content_backend
 
     print("=" * 78)
-    print(f"KFold-evaluator")
+    print("KFold-evaluator")
     print(f"  apply_fix        = {apply_fix}")
     print(f"  weight_valp1     = {weight_valp1}")
     print(f"  weight_p2        = {weight_p2}")
@@ -306,12 +266,12 @@ def main() -> None:
     val_solution = data["val_solution"]
     val_gt_raw = dict(zip(val_solution["id"], val_solution["ground_truth"]))
 
-    # ==== 1. Статистики ====
+    # 1. Статистики
     print(f"\n[1/4] Статистики (content_backend={content_backend})...")
     stats = FeatureStats.fit(train, modules, content_backend=content_backend)
     stats.add_val_solution_popularity(val_solution)
 
-    # ==== 2. Фиксированные срезы ====
+    # 2. Фиксированные срезы
     print("\n[2/4] Фиксированные срезы (p0/p1/pmask)...")
     train_students_p1 = [
         s for s in train
@@ -326,7 +286,7 @@ def main() -> None:
     print(f"      p1={len(train_df_p1):,}  p0={len(train_df_p0):,}  "
           f"pmask={len(train_df_pmask):,}")
 
-    # ==== 3. KFold по warm-val ====
+    # 3. KFold по warm-val
     print(f"\n[3/4] {n_folds}-fold по warm-val...")
     val_p1_records = [s for s in val if _n_periods(s) == 1]
     val_p2_records = [s for s in val if _n_periods(s) == 2]
@@ -351,7 +311,6 @@ def main() -> None:
         fold_valp1_hold = [s for s, t in fold_hold if t == 'p1']
         fold_valp2_hold = [s for s, t in fold_hold if t == 'p2']
 
-        # --- Срезы этого фолда ---
         train_parts = [train_df_p1, train_df_p0, train_df_pmask]
 
         if weight_valp1 > 0 and fold_valp1_train:
@@ -382,7 +341,6 @@ def main() -> None:
             df_vp2["student_id"] = "vp2__" + df_vp2["student_id"].astype(str)
             train_parts.append(df_vp2)
 
-        # --- Holdout срезы ---
         hold_parts = []
         if fold_valp1_hold:
             df_hp1 = build_dataset(
@@ -415,7 +373,6 @@ def main() -> None:
         train_df_fold = pd.concat(train_parts, ignore_index=True)
         hold_df_fold = pd.concat(hold_parts, ignore_index=True)
 
-        # Единое кодирование
         n_train = len(train_df_fold)
         n_hold = len(hold_df_fold)
         all_df = pd.concat([train_df_fold, hold_df_fold], ignore_index=True)
@@ -428,7 +385,6 @@ def main() -> None:
         X_hold, y_hold, g_hold, w_hold, hold_sorted = prepare_xygw(
             hold_df_fold, feature_cols=feature_cols)
 
-        # --- Модели на всех seeds ---
         hold_preds_list: list[np.ndarray] = []
         for seed in seeds:
             params = {**FAST_PARAMS, "seed": seed + fold_idx * 100}
@@ -455,7 +411,7 @@ def main() -> None:
             rec_fold_clean[sid_clean] = rec
             oof_rec[sid_clean] = rec
 
-        # --- Диагностика фолда (правильная, по чистым ID) ---
+        # Диагностика фолда по чистым ID
         p1_ids_hold = {s["id"] for s in fold_valp1_hold}
         p2_ids_hold = {s["id"] for s in fold_valp2_hold}
         m_p1 = _mean_for_ids(rec_fold_clean, val_gt_raw, p1_ids_hold)
@@ -473,8 +429,8 @@ def main() -> None:
         print(f"      fold {fold_idx+1}: p1_ho={len(p1_ids_hold)} p2_ho={len(p2_ids_hold)} "
               f"| OOF p1={m_p1:.4f} p2={m_p2:.4f} | n_train={n_train:,}")
 
-    # ==== 4. Итог ====
-    print(f"\n[4/4] Итог:")
+    # 4. Итог
+    print("\n[4/4] Итог:")
 
     p1_ids_all = {s["id"] for s in val_p1_records}
     p2_ids_all = {s["id"] for s in val_p2_records}
@@ -492,7 +448,7 @@ def main() -> None:
 
     composite = TEST_COLD_SHARE * m_cold + (1 - TEST_COLD_SHARE) * m_warm_all
 
-    print(f"\n      Warm OOF:")
+    print("\n      Warm OOF:")
     print(f"          p1 (n={len(p1_ids_all)}):     {m_p1_all:.4f}")
     print(f"          p2 (n={len(p2_ids_all)}):     {m_p2_all:.4f}")
     print(f"          всего (n={len(p1_ids_all|p2_ids_all)}): {m_warm_all:.4f}")
@@ -500,7 +456,6 @@ def main() -> None:
     print(f"\n      Composite = {composite:.4f}")
     print(f"          (0.352 × {m_cold:.4f} + 0.648 × {m_warm_all:.4f})")
 
-    # Разброс по фолдам
     p1_folds = [f["m_p1"] for f in fold_stats if f["n_p1_hold"] > 0]
     p2_folds = [f["m_p2"] for f in fold_stats if f["n_p2_hold"] > 0]
     if p1_folds:

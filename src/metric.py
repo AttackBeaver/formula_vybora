@@ -2,26 +2,18 @@
 Локальная метрика pNDCG@5 — согласована с официальным чекером.
 
 pNDCG@5 = min(1.0, DCG@5)
-DCG@5 = Σ_{i=1..5} weight(priority_i) / log2(i + 1)
+DCG@5   = Σ_{i=1..5} weight(priority_i) / log2(i + 1)
 weights = {1: 1.00, 2: 0.80, 3: 0.60, 4: 0.45, 5: 0.35}
 
 ВАЖНО: score ОБРЕЗАЕТСЯ сверху единицей. Это не классический NDCG.
 Идеальный ответ — priority-1 модуль на позиции 1 (даёт ровно 1.0).
 
 Публичный API:
-    parse_ground_truth(raw)                      → dict[str, int]
-    pndcg_at_k(rec, target, k=5)                 → float  (один студент)
-    evaluate_pndcg5(rec_all, gt_raw, k=5)        → (mean, per_student)
-    hit_at_k(rec, target, k=5)                   → int    (0/1)
-    recall_at_k(rec, target, k=5)                → float  (|∩| / |target|)
-
-Используется:
-    * ltr_model.pndcg5_eval                     — custom eval LightGBM
-    * kfold_eval, eval_clean                    — OOF/honest eval
-    * estimate_test_score                       — composite
-    * run_ltr_*                                 — оценка val/holdout
-    * features.make_target_from_val_solution    — парсинг val_solution
-    * evaluate.py                               — CLI-сверка с официальным
+    parse_ground_truth(raw)               → dict[str, int]
+    pndcg_at_k(rec, target, k=5)          → float
+    evaluate_pndcg5(rec_all, gt_raw, k=5) → (mean, per_student)
+    hit_at_k(rec, target, k=5)            → int (0/1)
+    recall_at_k(rec, target, k=5)         → float (|∩| / |target|)
 """
 from __future__ import annotations
 
@@ -32,15 +24,11 @@ PRIORITY_WEIGHTS: dict[int, float] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Парсинг
-# ---------------------------------------------------------------------------
 def parse_ground_truth(raw: str | None) -> dict[str, int]:
     """
-    Разбирает строку вида 'm_001:1 m_002:3 m_003:2 ...' → {module_id: priority}.
+    'm_001:1 m_002:3 ...' → {module_id: priority}.
 
-    Устойчив к обрамляющим кавычкам (встречаются в CSV после pandas).
-    Пустая строка / None → {}.
+    Устойчив к обрамляющим кавычкам (CSV после pandas). None/пустое → {}.
     Битые токены (без ':' или с непарсящимся приоритетом) пропускаются.
     """
     if raw is None:
@@ -63,9 +51,6 @@ def parse_ground_truth(raw: str | None) -> dict[str, int]:
     return result
 
 
-# ---------------------------------------------------------------------------
-# Внутренние helper'ы
-# ---------------------------------------------------------------------------
 def _dcg_at_k_raw(rec: list[str], target: dict[str, int], k: int = 5) -> float:
     """DCG@k БЕЗ clip — для диагностики. Не использовать напрямую в метрике."""
     dcg = 0.0
@@ -80,23 +65,18 @@ def _dcg_at_k_raw(rec: list[str], target: dict[str, int], k: int = 5) -> float:
 
 
 def _as_target(target: dict[str, int] | str) -> dict[str, int]:
-    """Приводит target к dict (принимает строку, если передали сырое)."""
+    """Приводит target к dict (парсит строку, если передали сырую)."""
     if isinstance(target, str):
         return parse_ground_truth(target)
     return target
 
 
-# ---------------------------------------------------------------------------
-# Публичные метрики per-student
-# ---------------------------------------------------------------------------
 def pndcg_at_k(
     rec: list[str],
     target: dict[str, int] | str,
     k: int = 5,
 ) -> float:
-    """
-    pNDCG@k для одного студента (со clip до 1.0 — как официальный чекер).
-    """
+    """pNDCG@k одного студента со clip до 1.0 (как официальный чекер)."""
     tgt = _as_target(target)
     return min(1.0, _dcg_at_k_raw(rec, tgt, k=k))
 
@@ -106,10 +86,9 @@ def hit_at_k(
     target: dict[str, int] | str,
     k: int = 5,
 ) -> int:
-    """
-    hit@k: 1 если хотя бы один из top-k попал в target (любой приоритет), иначе 0.
+    """1 если хотя бы один из top-k попал в target (любой приоритет), иначе 0.
 
-    Возвращает int (не bool), чтобы np.mean(hits) давал долю студентов с попаданием.
+    Возвращает int (не bool), чтобы np.mean(hits) давал долю студентов.
     """
     tgt = _as_target(target)
     for mid in rec[:k]:
@@ -123,12 +102,7 @@ def recall_at_k(
     target: dict[str, int] | str,
     k: int = 5,
 ) -> float:
-    """
-    recall@k: |top-k ∩ target| / |target|.
-
-    Знаменатель — число модулей в target (в нашем датасете всегда 5,
-    но не закладываемся на константу).
-    """
+    """|top-k ∩ target| / |target|. Знаменатель — len(target), не константа 5."""
     tgt = _as_target(target)
     if not tgt:
         return 0.0
@@ -136,20 +110,12 @@ def recall_at_k(
     return hit / len(tgt)
 
 
-# ---------------------------------------------------------------------------
-# Пакетная оценка
-# ---------------------------------------------------------------------------
 def evaluate_pndcg5(
     rec: dict[str, list[str]],
     gt_raw: dict[str, str],
     k: int = 5,
 ) -> tuple[float, dict[str, float]]:
-    """
-    Возвращает (mean_score, per_student_dict).
-
-    per_student_dict содержит только студентов, у которых есть и rec,
-    и непустой gt. Студенты без rec или без target'а пропускаются.
-    """
+    """(mean, per_student). Пропускает студентов без rec или с пустым gt."""
     per_student: dict[str, float] = {}
     for sid, raw in gt_raw.items():
         if sid not in rec:
@@ -164,9 +130,6 @@ def evaluate_pndcg5(
     return float(mean), per_student
 
 
-# ---------------------------------------------------------------------------
-# Self-test
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     print("=" * 72)
     print("Self-test src/metric.py")

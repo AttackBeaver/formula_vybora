@@ -1,15 +1,5 @@
 """
 CLI: оценка pNDCG@5 по submission-файлу.
-
-Считает:
-    1. Наш pNDCG@5 (src.metric) — с разбивкой по студентам.
-    2. Официальный pNDCG@5 (metric.py в корне) — как контрольный скор.
-
-Если оба числа совпадают — реализация верна.
-
-Запуск из корня проекта:
-    python -m src.evaluate
-    python -m src.evaluate --submission submissions/val_submission_popularity.csv
 """
 from __future__ import annotations
 
@@ -32,9 +22,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SUBMISSION = PROJECT_ROOT / "submissions" / "val_submission_popularity.csv"
 
 
-# ---------------------------------------------------------------------------
-# Загрузка
-# ---------------------------------------------------------------------------
 def load_predictions(path: Path) -> dict[str, list[str]]:
     """Читает submission.csv формата id,recommendations."""
     df = pd.read_csv(path)
@@ -45,18 +32,11 @@ def load_predictions(path: Path) -> dict[str, list[str]]:
 
 
 def load_ground_truth(df: pd.DataFrame) -> dict[str, str]:
-    """{id: 'm_XXX:priority ...'}"""
     return dict(zip(df["id"], df["ground_truth"]))
 
 
-# ---------------------------------------------------------------------------
-# Сверка с официальным metric.py
-# ---------------------------------------------------------------------------
 def official_score(sub_path: Path, sol_path: Path) -> str:
-    """
-    Вызывает официальный metric.py через subprocess.
-    Возвращает его stdout как строку (одна или две строки).
-    """
+    """Запускает официальный metric.py; возвращает stdout (или текст ошибки)."""
     import subprocess
     import sys
 
@@ -75,9 +55,6 @@ def official_score(sub_path: Path, sol_path: Path) -> str:
     return result.stdout.strip()
 
 
-# ---------------------------------------------------------------------------
-# Основной сценарий
-# ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description="Оценка pNDCG@5")
     parser.add_argument(
@@ -93,7 +70,6 @@ def main() -> None:
     print("ОЦЕНКА pNDCG@5")
     print("=" * 64)
 
-    # ---- 1. Данные ------------------------------------------------------
     data = load_all()
     val_sol = data["val_solution"]
 
@@ -103,7 +79,6 @@ def main() -> None:
     print(f"      Студентов в submission:   {len(preds)}")
     print(f"      Студентов в ground truth: {len(gt)}")
 
-    # ---- 2. Наша метрика ------------------------------------------------
     print("\n[2/4] Наша метрика (src.metric):")
     mean, per_student = evaluate_pndcg5(preds, gt)
 
@@ -123,7 +98,6 @@ def main() -> None:
     print(f"      нулевых   (=0.0): {n_zero:>5}  "
           f"({100 * n_zero / len(values):.1f}%)")
 
-    # ---- 3. Справочные метрики ------------------------------------------
     print("\n[3/4] Справочно:")
     hits, recalls = [], []
     for sid, gt_str in gt.items():
@@ -136,7 +110,6 @@ def main() -> None:
     print(f"      hit@5    = {np.mean(hits):.4f}")
     print(f"      recall@5 = {np.mean(recalls):.4f}")
 
-    # ---- 4. Официальный metric.py ---------------------------------------
     print("\n[4/4] Официальный metric.py:")
     print("      " + official_score(sub_path, sol_path).replace("\n", "\n      "))
 

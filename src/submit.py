@@ -1,15 +1,11 @@
 """
-Запись submission.csv в формате соревнования.
+Запись submission.csv.
 
-Формат (из ТЗ):
     id,recommendations
     s_000123,m_014 m_087 m_031 m_155 m_022
 
-Правила:
-    - одна строка на студента;
-    - ровно k различных module_id;
-    - порядок — от наиболее релевантного к менее;
-    - module_id разделены пробелами.
+Одна строка на студента, ровно k различных module_id через пробел,
+от более релевантного к менее.
 """
 from __future__ import annotations
 
@@ -24,15 +20,8 @@ def write_submission(
     k: int = 5,
 ) -> pd.DataFrame:
     """
-    Сохраняет рекомендации в CSV.
-
-    Args:
-        recommendations: dict[student_id, list[module_id]].
-        path: куда сохранять.
-        k: требуемая длина каждой рекомендации.
-
-    Returns:
-        DataFrame, который был записан (для проверок).
+    Сохраняет рекомендации в CSV и возвращает записанный DataFrame
+    (для проверок).
     """
     rows: list[dict[str, str]] = []
 

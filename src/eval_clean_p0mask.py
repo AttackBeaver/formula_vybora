@@ -1,37 +1,5 @@
 """
 eval_clean_p0mask.py — honest eval рецепта v37 БЕЗ p2-среза.
-
-ЗАЧЕМ:
-    eval_clean показал на новой data (train=5002):
-        v4  (no p0_mask): cold=0.2239 composite=0.3203
-        v12 (no p0_mask): cold=0.1264 composite=0.2918   ← регресс
-
-    Причина: V12 добавляет глобальные rank-фичи, но без p0_mask модель
-    НЕ видит ни одного cold-студента в обучении и не учится их
-    использовать. Для cold предсказания становятся случайными.
-
-    В v37 (run_ltr_v37) cold был 0.3308 — но там был И p0_mask=3.0,
-    И p2-срез (утечка). Что именно дало +0.10 cold — неизвестно.
-
-    Этот скрипт изолирует переменную: p0_mask есть, p2 НЕТ.
-    Если cold ≥ 0.30 → рецепт v37 работает без утечки.
-    Если cold ~0.20 → в v37 холод поднимался p2-срезом (утечка).
-
-ПАРАМЕТРЫ:
-    --feature-set {v4,v11,v12,v7,v6}   (default v12)
-    --content-backend {tfidf,both}     (default tfidf)
-    --weight-p0mask FLOAT              (default 3.0)
-    --weight-p0 FLOAT                  (default 0.3)
-    --n-seeds INT                      (default 3)
-
-ЗАПУСК (два прогона для A/B):
-    python -m src.eval_clean_p0mask --feature-set v4  --n-seeds 3
-    python -m src.eval_clean_p0mask --feature-set v12 --n-seeds 3
-
-Смотрим:
-    cold(v12) − cold(v4) ≥ +0.05   →  V12+p0mask реален, рецепт v37 работает
-    cold(v12) − cold(v4) ∈ [+0.01, +0.05]  →  слабый сигнал
-    cold(v12) − cold(v4) < +0.01   →  v37 был артефактом p2-утечки
 """
 from __future__ import annotations
 
@@ -85,8 +53,6 @@ FAST_PARAMS: dict[str, Any] = {
 }
 NUM_BOOST_ROUND = 2500
 EARLY_STOPPING = 100
-
-_cold_cache: set[str] = set()
 
 
 def _add_weight(df: pd.DataFrame, weight: float) -> pd.DataFrame:
@@ -160,11 +126,10 @@ def main() -> None:
     val_solution = data["val_solution"]
     gt_raw = dict(zip(val_solution["id"], val_solution["ground_truth"]))
 
-    global _cold_cache
-    _cold_cache = identify_cold_students(val)
-    print(f"\nval cold: {len(_cold_cache)}, warm: {len(val) - len(_cold_cache)}")
+    cold_ids_val = identify_cold_students(val)
+    print(f"\nval cold: {len(cold_ids_val)}, warm: {len(val) - len(cold_ids_val)}")
 
-    # ==== 1. Внутренний ES-split ====
+    # 1. Внутренний ES-split
     rng = random.Random(ES_SEED)
     train_shuffled = list(train)
     rng.shuffle(train_shuffled)
@@ -173,11 +138,11 @@ def main() -> None:
     core_students = train_shuffled[n_es:]
     print(f"\n[1/5] ES-split: core={len(core_students)}, es={len(es_students)}")
 
-    # ==== 2. FeatureStats ====
+    # 2. FeatureStats
     print(f"\n[2/5] FeatureStats (content_backend='{args.content_backend}')...")
     stats = FeatureStats.fit(train, modules, content_backend=args.content_backend)
 
-    # ==== 3. Датасеты ====
+    # 3. Датасеты
     print("\n[3/5] Строю train (p0/p1/pmask/p0_mask) и ES...")
     core_p1 = [s for s in core_students
                if any(h.get("period") == 2 for h in s.get("history", []))]
@@ -263,7 +228,7 @@ def main() -> None:
     print(f"      Train: X={X_train.shape}, групп={len(g_train)}")
     print(f"      ES:    X={X_es.shape},   групп={len(g_es)}")
 
-    # ==== 4. Multi-seed ====
+    # 4. Multi-seed
     print(f"\n[4/5] Обучение {n_seeds} моделей...")
     val_scores_list: list[np.ndarray] = []
     best_iters: list[int] = []
@@ -291,17 +256,17 @@ def main() -> None:
     print(f"      best_iter: mean={np.mean(best_iters):.0f}, "
           f"min={min(best_iters)}, max={max(best_iters)}")
 
-    # ==== 5. Оценка ====
+    # 5. Оценка
     print("\n[5/5] Сегментные оценки на val:")
     rec_val = top_k_per_student(val_sorted, val_scores, k=5)
     _, per_student = evaluate_pndcg5(rec_val, gt_raw, k=5)
 
-    cold_ids = [s["id"] for s in val if s["id"] in _cold_cache]
+    cold_ids = [s["id"] for s in val if s["id"] in cold_ids_val]
     p1_ids = [s["id"] for s in val
-              if s["id"] not in _cold_cache
+              if s["id"] not in cold_ids_val
               and len(s.get("history") or []) == 1]
     p2_ids = [s["id"] for s in val
-              if s["id"] not in _cold_cache
+              if s["id"] not in cold_ids_val
               and len(s.get("history") or []) >= 2]
 
     m_cold, n_cold = _seg_mean(per_student, cold_ids)
@@ -321,14 +286,14 @@ def main() -> None:
     print(f"      0.352·{m_cold:.4f} + 0.020·{m_p1:.4f} + "
           f"0.628·{m_p2:.4f}")
 
-    print(f"\n  Ориентиры:")
-    print(f"    v4 no-p0mask   cold=0.2239  composite=0.3203")
-    print(f"    v12 no-p0mask  cold=0.1264  composite=0.2918")
-    print(f"    v37 (p0mask+p2) cold=0.3308 (утечка через p2)")
-    print(f"\n  Критерии:")
-    print(f"    cold ≥ 0.30  →  V12+p0mask реально работает, рецепт v37 ok")
-    print(f"    cold ≥ 0.26  →  частичный сигнал, fallback не нужен")
-    print(f"    cold < 0.24  →  p0mask не тянет, v37 был артефактом p2")
+    print("\n  Ориентиры:")
+    print("    v4 no-p0mask   cold=0.2239  composite=0.3203")
+    print("    v12 no-p0mask  cold=0.1264  composite=0.2918")
+    print("    v37 (p0mask+p2) cold=0.3308 (утечка через p2)")
+    print("\n  Критерии:")
+    print("    cold ≥ 0.30  →  V12+p0mask реально работает, рецепт v37 ok")
+    print("    cold ≥ 0.26  →  частичный сигнал, fallback не нужен")
+    print("    cold < 0.24  →  p0mask не тянет, v37 был артефактом p2")
 
     print(f"\n[OK] eval_clean_p0mask завершён за {time.time() - t0:.1f} сек.")
 

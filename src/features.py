@@ -1,51 +1,22 @@
 """
-Feature engineering для LTR-модели.
+Feature engineering для LTR-модели: S (студент), M (модуль), S×M (взаимодействия).
 
-Строит признаки трёх групп:
-    S   — признаки студента;
-    M   — признаки модуля;
-    S×M — взаимодействие (co-occurrence, content-косинус, already_chosen, ...).
+Все агрегаты считаются один раз на train (fit) и переиспользуются для
+val/test (transform) — без training-serving skew.
 
-Все агрегаты вычисляются один раз на train (fit) и переиспользуются
-для val/test (transform) — это устраняет training-serving skew.
+build_dataset всегда добавляет `label` (для test — target_fn=None → label=0),
+единый интерфейс без ветвлений.
 
-Ключевые свойства:
-* build_dataset ВСЕГДА добавляет колонку `label`, даже когда target_fn=None
-  (для test). В этом случае label=0 — единый интерфейс без ветвлений.
-* Есть режим маскирования профиля (mask_profile / mask_student_ids):
-  нужен для обучения LTR на cold-подобных примерах.
-  ВНИМАНИЕ: p0_mask (mask_profile=True + past_periods=[]) НЕ ПЕРЕНОСИТСЯ
-  на test cold (эксперимент v43 показал cold=0.028 на public при 0.34 на
-  val). Не использовать в production-моделях на cold.
-* Относительные периоды (pop_last_period, pop_prev_period, pop_first_period):
-  устраняют сдвиг распределения между train (история до P2) и test
-  (история до P3/P4).
-* max_history_periods: обрезает историю до последних N периодов и
-  нормализует номера к (1, 2, ...).
+mask_profile / mask_student_ids — обучение на cold-подобных примерах.
+ВНИМАНИЕ: p0_mask (mask_profile=True + past_periods=[]) НЕ ПЕРЕНОСИТСЯ на
+test cold (v43: cold=0.028 на public против 0.34 на val). Не использовать
+в production для cold.
 
-Content-backends:
-* "tfidf" — TF-IDF по title+description.
-* "embed" — семантические эмбеддинги (MiniLM).
-* "both"  — оба.
-* "none"  — без content (диагностика).
+Относительные периоды (pop_last/prev/first_period) устраняют сдвиг между
+train (история до P2) и test (до P3/P4). max_history_periods обрезает
+историю до последних N и перенумеровывает к (1, 2, ...).
 
-Кандидаты:
-* make_candidates_train_period2(stats) — 174 модуля (2 ∈ available_in_periods).
-* make_candidates_train_period1(stats) — 196 модулей (1 ∈ available_in_periods).
-* make_candidates_all(stats)           — все 322 модуля.
-
-Глобальные rank-фичи (v11, v37+):
-* pop_rank_global          — ранг модуля по pop_weighted среди всех 322.
-* pop_rank_global_in_avail — ранг среди candidates студента.
-* pop_rank_global_frac     — нормализованный.
-
-Динамика популярности (v14, v45+):
-* pop_delta      = pop_last_period − pop_prev_period       (абсолютный тренд).
-* pop_delta_norm = delta / (last + prev + 1e-6)             (нормализованный, −1..+1).
-* pop_delta_rank — ранг модуля по pop_delta среди candidates.
-
-Для студентов с 1 периодом (prev_p=None) и cold → delta = 0.
-Для студентов с 2+ периодами — работает.
+content_backend: "tfidf" | "embed" | "both" | "none".
 """
 from __future__ import annotations
 
@@ -59,9 +30,6 @@ import pandas as pd
 from src.content import ContentModel
 from src.content_embed import ContentEmbedModel
 
-# ---------------------------------------------------------------------------
-# Константы
-# ---------------------------------------------------------------------------
 PRIORITY_WEIGHTS: dict[int, float] = {
     1: 1.00, 2: 0.80, 3: 0.60, 4: 0.45, 5: 0.35,
 }
@@ -71,13 +39,8 @@ DEFAULT_SPECIALTY = "UNKNOWN"
 VALID_CONTENT_BACKENDS = ("tfidf", "embed", "both", "none")
 
 
-# ===========================================================================
-# FeatureStats
-# ===========================================================================
 class FeatureStats:
-    """
-    Агрегаты, вычисленные один раз на train. НЕ пересчитываются для val/test.
-    """
+    """Агрегаты, посчитанные один раз на train; для val/test не пересчитываются."""
 
     def __init__(self, content_backend: str = "tfidf") -> None:
         if content_backend not in VALID_CONTENT_BACKENDS:
@@ -87,7 +50,6 @@ class FeatureStats:
             )
         self.content_backend: str = content_backend
 
-        # --- Популярность ---
         self.pop_weighted: dict[str, float] = {}
         self.pop_raw: dict[str, int] = {}
         self.pop_by_institute: dict[str, dict[str, float]] = defaultdict(
@@ -99,25 +61,19 @@ class FeatureStats:
         self.pop_by_period: dict[int, dict[str, float]] = defaultdict(
             lambda: defaultdict(float)
         )
-        # --- Глобальный ранг по pop_weighted (v11) ---
         self.pop_rank_global: dict[str, int] = {}
         self.n_modules_global: int = 0
-        # --- Co-occurrence ---
         self.cooc: dict[str, Counter] = defaultdict(Counter)
         self.module_doc_freq: dict[str, int] = {}
         self.n_students_total: int = 0
-        # --- Метаданные модулей ---
         self.module_title_len: dict[str, int] = {}
         self.module_desc_len: dict[str, int] = {}
         self.module_periods: dict[str, set[int]] = {}
-        # --- Content-based ---
         self.content_model_tfidf: ContentModel | None = None
         self.content_model_embed: ContentEmbedModel | None = None
-        # --- Служебное ---
         self.median_pop_weighted: float = 0.0
         self._has_period_3: bool = False
 
-    # -----------------------------------------------------------------------
     @classmethod
     def fit(
         cls,
@@ -127,7 +83,7 @@ class FeatureStats:
     ) -> "FeatureStats":
         stats = cls(content_backend=content_backend)
 
-        # --- 1. Метаданные модулей ---
+        # 1. Метаданные модулей
         for m in modules:
             mid = m["module_id"]
             stats.module_title_len[mid] = len(m.get("title") or "")
@@ -135,7 +91,7 @@ class FeatureStats:
             stats.module_periods[mid] = set(m.get("available_in_periods") or [])
         stats.n_modules_global = len(stats.module_periods)
 
-        # --- 2. Content-based модели ---
+        # 2. Content-модели
         if content_backend in ("tfidf", "both"):
             print(f"[FeatureStats] TF-IDF: fit на {len(modules)} модулях...")
             stats.content_model_tfidf = ContentModel.fit(modules)
@@ -143,7 +99,7 @@ class FeatureStats:
             print(f"[FeatureStats] Embeddings: fit на {len(modules)} модулях...")
             stats.content_model_embed = ContentEmbedModel.fit(modules)
 
-        # --- 3. Популярность и co-occurrence ---
+        # 3. Популярность и co-occurrence
         stats.n_students_total = len(train)
         for student in train:
             inst = (student.get("profile") or {}).get("institute") or DEFAULT_INSTITUTE
@@ -176,7 +132,7 @@ class FeatureStats:
                 np.median(list(stats.pop_weighted.values()))
             )
 
-        # --- 4. Глобальный ранг ---
+        # 4. Глобальный ранг
         sorted_modules = sorted(
             stats.module_periods.keys(),
             key=lambda m: (-stats.pop_weighted.get(m, 0.0), m),
@@ -184,11 +140,10 @@ class FeatureStats:
         stats.pop_rank_global = {m: r for r, m in enumerate(sorted_modules)}
         return stats
 
-    # -----------------------------------------------------------------------
     def add_val_solution_popularity(self, val_solution: pd.DataFrame) -> None:
         """
-        Добавляет pop_by_period[3] из val_solution. Используется в v7-схеме
-        (p2-срез для warm). НЕ пересчитывает pop_rank_global.
+        Добавляет pop_by_period[3] из val_solution (схема v7: p2-срез для warm).
+        pop_rank_global НЕ пересчитывает.
         """
         n_rows = 0
         for _, row in val_solution.iterrows():
@@ -210,9 +165,8 @@ class FeatureStats:
         print(f"[FeatureStats] pop_by_period[3] построен из val_solution: "
               f"{n_rows} студентов, {len(self.pop_by_period[3])} модулей")
 
-    # -----------------------------------------------------------------------
     def ppmi(self, a: str, b: str) -> float:
-        """PPMI между двумя модулями: max(0, log( P(a,b) / (P(a)·P(b)) ))."""
+        """PPMI между модулями: max(0, log( P(a,b) / (P(a)·P(b)) ))."""
         cooc_ab = self.cooc.get(a, Counter()).get(b, 0)
         if cooc_ab == 0:
             return 0.0
@@ -224,9 +178,6 @@ class FeatureStats:
         return max(0.0, pmi)
 
 
-# ===========================================================================
-# Построитель датасета
-# ===========================================================================
 def _safe_get(d: dict[str, Any] | None, key: str, default: str = "UNKNOWN") -> str:
     if not d:
         return default
@@ -244,14 +195,10 @@ def build_dataset(
     max_history_periods: int | None = None,
 ) -> pd.DataFrame:
     """
-    Строит feature-датасет для списка студентов.
-
-    Возвращает DataFrame с колонками:
-        student_id, module_id, <S/M/S×M признаки>,
-        tfidf_cos_mean/max, embed_cos_mean/max,
-        pop_rank_global, pop_rank_global_in_avail, pop_rank_global_frac,
-        pop_delta, pop_delta_norm, pop_delta_rank,
-        priority, label
+    Колонки: student_id, module_id, S/M/S×M признаки,
+    tfidf_cos_mean/max, embed_cos_mean/max,
+    pop_rank_global / _in_avail / _frac,
+    pop_delta / _norm / _rank, priority, label.
     """
     rows: list[dict[str, Any]] = []
     tfidf_model = stats.content_model_tfidf
@@ -264,7 +211,6 @@ def build_dataset(
         if sid is None:
             continue
 
-        # --- Маскировать ли студента ---
         if use_id_filter:
             do_mask = sid in mask_student_ids  # type: ignore[operator]
         else:
@@ -277,7 +223,7 @@ def build_dataset(
             profile = student.get("profile") or {}
             history_raw = student.get("history", []) or []
 
-        # --- Обрезка истории до последних N периодов + нормализация ---
+        # Обрезка истории: последние N периодов, перенумерация 1..N.
         original_history_periods: set[int] = set()
         if max_history_periods is not None and history_raw:
             all_periods = sorted({
@@ -311,7 +257,6 @@ def build_dataset(
         inst = _safe_get(profile, "institute")
         spec = _safe_get(profile, "specialty")
 
-        # --- История (с фильтром по past_periods) ---
         history_modules: list[str] = []
         history_priorities: list[int] = []
         history_periods_used: list[int] = []
@@ -333,7 +278,7 @@ def build_dataset(
             and not profile.get("specialty")
         )
 
-        # --- Относительные периоды ---
+        # Относительные периоды: last / prev / first.
         unique_periods = sorted(set(history_periods_used))
         if len(unique_periods) == 0:
             last_p: int | None = None
@@ -358,7 +303,7 @@ def build_dataset(
         pop_first_map = _pop_map(first_p)
         has_prev = prev_p is not None
 
-        # --- Признаки студента (S) ---
+        # S-признаки
         student_feats: dict[str, Any] = {
             "institute": inst,
             "specialty": spec,
@@ -371,11 +316,9 @@ def build_dataset(
             "is_cold": int(is_cold),
         }
 
-        # --- Кандидаты ---
         candidates = candidates_fn(student)
         n_available = len(candidates)
 
-        # --- Content: TF-IDF ---
         if tfidf_model is not None:
             tfidf_profile = tfidf_model.student_profile_mean(history_modules)
             tfidf_cos_mean_arr = tfidf_model.cosine_mean(tfidf_profile, candidates)
@@ -384,7 +327,6 @@ def build_dataset(
             tfidf_cos_mean_arr = np.zeros(len(candidates), dtype=np.float32)
             tfidf_cos_max_arr = np.zeros(len(candidates), dtype=np.float32)
 
-        # --- Content: Embeddings ---
         if embed_model is not None:
             embed_profile = embed_model.student_profile_mean(history_modules)
             embed_cos_mean_arr = embed_model.cosine_mean(embed_profile, candidates)
@@ -393,12 +335,10 @@ def build_dataset(
             embed_cos_mean_arr = np.zeros(len(candidates), dtype=np.float32)
             embed_cos_max_arr = np.zeros(len(candidates), dtype=np.float32)
 
-        # --- Ранг среди кандидатов по институтской популярности ---
         inst_pop = stats.pop_by_institute.get(inst, {})
         sorted_by_inst_pop = sorted(candidates, key=lambda m: -inst_pop.get(m, 0.0))
         rank_by_inst_pop = {m: r for r, m in enumerate(sorted_by_inst_pop)}
 
-        # --- Ранг по глобальной популярности (v11) ---
         sorted_by_global_pop = sorted(
             candidates,
             key=lambda m: (-stats.pop_weighted.get(m, 0.0), m),
@@ -407,9 +347,8 @@ def build_dataset(
             m: r for r, m in enumerate(sorted_by_global_pop)
         }
 
-        # --- Ранг по pop_delta (v14) ---
-        # pop_delta = pop_last - pop_prev. Если prev_p=None (у студента только
-        # один период) — все delta = 0, ранжирование по module_id (нет сигнала).
+        # pop_delta = pop_last - pop_prev. При prev_p=None (один период) все
+        # delta = 0, ранг — по module_id (нет сигнала).
         delta_scores: dict[str, float] = {}
         for m in candidates:
             if has_prev:
@@ -423,10 +362,8 @@ def build_dataset(
         )
         rank_by_delta = {m: r for r, m in enumerate(sorted_by_delta)}
 
-        # --- Ground truth ---
         target_map: dict[str, int] = target_fn(student) if target_fn else {}
 
-        # --- Пробегаем по кандидатам ---
         for i, mid in enumerate(candidates):
             pop_last = pop_last_map.get(mid, 0.0)
             pop_prev = pop_prev_map.get(mid, 0.0)
@@ -525,9 +462,6 @@ def build_dataset(
     return pd.DataFrame(rows)
 
 
-# ===========================================================================
-# Кандидаты
-# ===========================================================================
 def candidates_available(student: dict[str, Any]) -> list[str]:
     return list(student.get("available_modules") or [])
 
@@ -557,16 +491,13 @@ def make_candidates_train_period1(
 def make_candidates_all(
     stats: FeatureStats,
 ) -> Callable[[dict[str, Any]], list[str]]:
-    """Все 322 модуля. Экспериментально — holdout падает (v34)."""
+    """Все 322 модуля. Экспериментально: holdout падает (v34)."""
     all_modules = sorted(stats.module_periods.keys())
     def fn(student: dict[str, Any]) -> list[str]:
         return all_modules
     return fn
 
 
-# ===========================================================================
-# Таргеты
-# ===========================================================================
 def target_period_2(student: dict[str, Any]) -> dict[str, int]:
     for h in student.get("history", []):
         if h.get("period") == 2:
@@ -597,9 +528,6 @@ def make_target_from_val_solution(
     return fn
 
 
-# ===========================================================================
-# CLI: проверка
-# ===========================================================================
 if __name__ == "__main__":
     import argparse
 
@@ -626,7 +554,7 @@ if __name__ == "__main__":
     stats = FeatureStats.fit(train, modules, content_backend=args.content_backend)
     stats.add_val_solution_popularity(val_solution)
 
-    print(f"\n[2/3] Проверка pop_delta на примере warm-студента (val_p2):")
+    print("\n[2/3] Проверка pop_delta на примере warm-студента (val_p2):")
     val_p2 = [s for s in val if len(s.get("history") or []) == 2][:1]
     if val_p2:
         df_p2 = build_dataset(
@@ -651,7 +579,7 @@ if __name__ == "__main__":
               f"med={df_p2['pop_delta_rank'].median():.0f}, "
               f"max={df_p2['pop_delta_rank'].max()}")
 
-    print(f"\n[3/3] Проверка pop_delta на cold-студенте (должно быть 0):")
+    print("\n[3/3] Проверка pop_delta на cold-студенте (должно быть 0):")
     test_cold = next((s for s in test if not (s.get("history") or [])), test[0])
     df_cold = build_dataset(
         [test_cold], stats,
